@@ -136,3 +136,106 @@ fn parse_secs(s: &str) -> Result<Duration, String> {
         .map(Duration::from_secs)
         .map_err(|e| format!("invalid seconds value: {e}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presets_match_known_genesis_times() {
+        assert_eq!(Network::Mainnet.preset_genesis_time(), Some(1_606_824_023));
+        assert_eq!(Network::Hoodi.preset_genesis_time(), Some(1_742_213_400));
+        assert_eq!(Network::Sepolia.preset_genesis_time(), Some(1_655_733_600));
+        assert_eq!(Network::Holesky.preset_genesis_time(), Some(1_695_902_400));
+    }
+
+    #[test]
+    fn presets_use_ethereum_slot_duration() {
+        for n in [
+            Network::Mainnet,
+            Network::Hoodi,
+            Network::Sepolia,
+            Network::Holesky,
+        ] {
+            assert_eq!(n.preset_seconds_per_slot(), Some(12));
+        }
+    }
+
+    #[test]
+    fn custom_has_no_presets() {
+        assert_eq!(Network::Custom.preset_genesis_time(), None);
+        assert_eq!(Network::Custom.preset_seconds_per_slot(), None);
+    }
+
+    fn parse(extra: &[&str]) -> Config {
+        let mut argv = vec!["ethryx"];
+        argv.extend_from_slice(extra);
+        Config::try_parse_from(argv).expect("clap parse")
+    }
+
+    #[test]
+    fn explicit_genesis_overrides_network_preset() {
+        let cfg = parse(&["--network", "hoodi", "--cl-genesis-time", "999"]);
+        assert_eq!(cfg.resolve_cl_genesis_time().unwrap(), 999);
+    }
+
+    #[test]
+    fn network_preset_used_when_genesis_not_provided() {
+        let cfg = parse(&["--network", "sepolia"]);
+        assert_eq!(cfg.resolve_cl_genesis_time().unwrap(), 1_655_733_600);
+        assert_eq!(cfg.resolve_cl_seconds_per_slot().unwrap(), 12);
+    }
+
+    #[test]
+    fn custom_without_genesis_fails() {
+        let cfg = parse(&["--network", "custom"]);
+        assert!(cfg.resolve_cl_genesis_time().is_err());
+        assert!(cfg.resolve_cl_seconds_per_slot().is_err());
+    }
+
+    #[test]
+    fn custom_with_explicit_values_resolves() {
+        let cfg = parse(&[
+            "--network",
+            "custom",
+            "--cl-genesis-time",
+            "1700000000",
+            "--cl-seconds-per-slot",
+            "6",
+        ]);
+        assert_eq!(cfg.resolve_cl_genesis_time().unwrap(), 1_700_000_000);
+        assert_eq!(cfg.resolve_cl_seconds_per_slot().unwrap(), 6);
+    }
+
+    #[test]
+    fn cl_genesis_zero_disables_check_but_still_resolves() {
+        let cfg = parse(&["--cl-genesis-time", "0"]);
+        assert_eq!(cfg.resolve_cl_genesis_time().unwrap(), 0);
+    }
+
+    #[test]
+    fn listen_accepts_repeated_flag() {
+        let cfg = parse(&["--listen", "127.0.0.1:1", "--listen", "127.0.0.1:2"]);
+        assert_eq!(cfg.listen, vec!["127.0.0.1:1", "127.0.0.1:2"]);
+    }
+
+    #[test]
+    fn listen_accepts_comma_separated() {
+        let cfg = parse(&["--listen", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3"]);
+        assert_eq!(cfg.listen.len(), 3);
+        assert_eq!(cfg.listen[2], "127.0.0.1:3");
+    }
+
+    #[test]
+    fn parse_secs_accepts_integer() {
+        assert_eq!(parse_secs("30").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_secs("0").unwrap(), Duration::from_secs(0));
+    }
+
+    #[test]
+    fn parse_secs_rejects_non_integer() {
+        assert!(parse_secs("abc").is_err());
+        assert!(parse_secs("3.14").is_err());
+        assert!(parse_secs("-1").is_err());
+    }
+}

@@ -322,3 +322,66 @@ fn now_unix() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn hex_with_0x_prefix() {
+        assert_eq!(hex_to_u64("0x10"), Some(16));
+        assert_eq!(hex_to_u64("0xff"), Some(255));
+        assert_eq!(hex_to_u64("0x0"), Some(0));
+    }
+
+    #[test]
+    fn hex_without_prefix() {
+        assert_eq!(hex_to_u64("ff"), Some(255));
+        assert_eq!(hex_to_u64("a"), Some(10));
+    }
+
+    #[test]
+    fn hex_invalid_returns_none() {
+        assert_eq!(hex_to_u64("0xZZ"), None);
+        assert_eq!(hex_to_u64(""), None);
+        assert_eq!(hex_to_u64("not hex"), None);
+    }
+
+    #[test]
+    fn hex_handles_block_timestamp_width() {
+        // 32-bit-ish hex timestamp value (uppercase to ensure radix=16 accepts both cases)
+        assert_eq!(hex_to_u64("0x671E0000"), Some(0x671E_0000));
+    }
+
+    #[test]
+    fn decimal_str_parses_beacon_format() {
+        // Beacon API always quotes integers
+        let v = json!("9412341");
+        assert_eq!(parse_decimal_str(Some(&v)), Some(9_412_341));
+    }
+
+    #[test]
+    fn decimal_str_rejects_numeric_json() {
+        // If upstream ever returns unquoted (off-spec), refuse
+        let v = json!(42);
+        assert_eq!(parse_decimal_str(Some(&v)), None);
+    }
+
+    #[test]
+    fn decimal_str_handles_missing_field() {
+        assert_eq!(parse_decimal_str(None), None);
+    }
+
+    #[test]
+    fn decimal_str_rejects_garbage_string() {
+        let v = json!("not a number");
+        assert_eq!(parse_decimal_str(Some(&v)), None);
+    }
+
+    #[test]
+    fn decimal_str_handles_zero() {
+        let v = json!("0");
+        assert_eq!(parse_decimal_str(Some(&v)), Some(0));
+    }
+}
