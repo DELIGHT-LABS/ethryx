@@ -68,17 +68,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Build & upload static binary
-        id: upload
+      # Build + archive + checksum locally (dry-run skips upload so files
+      # remain in the workspace for attestation).
+      - name: Build static binary
+        id: build
         uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: ethryx
           target: ${{ matrix.target }}
           archive: ethryx-$tag-$target
           checksum: sha256
+          dry-run: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: ${{ steps.upload.outputs.archive }}
+          subject-path: |
+            ${{ steps.build.outputs.archive }}.tar.gz
+            ${{ steps.build.outputs.archive }}.zip
+
+      - name: Upload to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" "${{ steps.build.outputs.archive }}".*
