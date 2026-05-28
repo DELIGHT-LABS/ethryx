@@ -98,10 +98,10 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
-      - name: Install cross
-        uses: taiki-e/install-action@v2
+      - name: Setup cross-compile toolchain
+        uses: taiki-e/setup-cross-toolchain-action@v1
         with:
-          tool: cross
+          target: ${{ matrix.target }}
 
-      - name: cross build --release --target ${{ matrix.target }}
-        run: cross build --release --target ${{ matrix.target }} --locked
+      - name: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --locked
