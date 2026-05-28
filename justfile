@@ -1,0 +1,36 @@
+# List available recipes.
+default:
+    @just --list
+
+# Run all local quality checks (mirrors pre-commit + pre-push hooks).
+check:
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --locked -- -D warnings
+    cargo test --locked
+    cargo audit -D warnings
+
+# Apply rustfmt across the project.
+fmt:
+    cargo fmt --all
+
+# Run the sidecar locally with mainnet defaults pointing at localhost.
+run:
+    cargo run --release -- \
+        --listen 127.0.0.1:8547 \
+        --network mainnet
+
+# Dry-run a release (no changes applied). Levels: patch | minor | major | X.Y.Z
+release-dry level='patch':
+    cargo release {{level}}
+
+# Execute a release (bumps Cargo.toml/.lock, commits, tags, pushes; CI builds binaries).
+release level='patch':
+    cargo release {{level}} --execute
+
+# Run cargo-deny supply-chain checks.
+deny:
+    cargo deny check
+
+# HTML coverage report under target/llvm-cov/html/.
+coverage:
+    cargo llvm-cov --locked --html

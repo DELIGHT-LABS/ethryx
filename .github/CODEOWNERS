@@ -1,0 +1,9 @@
+# CODEOWNERS — automatic reviewer assignment.
+#
+# Replace the placeholder below with a real GitHub team or user handle, e.g.
+# `@DELIGHT-LABS/maintainers`, once the team exists. GitHub does not accept a
+# bare org handle here.
+#
+# Documentation: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# * @DELIGHT-LABS/maintainers

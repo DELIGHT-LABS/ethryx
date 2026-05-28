@@ -1,7 +1,14 @@
 [package]
 name = "ethryx"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.95"
+description = "Lightweight Rust sidecar multiplexing HTTP/WS and surfacing health for Ethereum EL/CL nodes."
+license = "MIT"
+repository = "https://github.com/DELIGHT-LABS/ethryx"
+readme = "README.md"
+keywords = ["ethereum", "sidecar", "proxy", "json-rpc", "beacon-api"]
+categories = ["network-programming"]
 
 [dependencies]
 clap = { version = "4.6", features = ["derive", "env"] }
@@ -24,3 +31,16 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 lto = "thin"
 codegen-units = 1
 strip = true
+panic = "abort"
+
+[package.metadata.release]
+publish = false                                              # binary, not a crate
+allow-branch = ["main"]                                      # release only from main
+tag-message = "Release v{{version}}"
+pre-release-commit-message = "chore: release v{{version}}"
+pre-release-hook = ["cargo", "test", "--locked"]             # gate before any state change
+pre-release-replacements = [
+    { file = "CHANGELOG.md", search = "Unreleased",             replace = "{{version}}",                              min = 1 },
+    { file = "CHANGELOG.md", search = "ReleaseDate",            replace = "{{date}}",                                 min = 1 },
+    { file = "CHANGELOG.md", search = "<!-- next-header -->",   replace = "<!-- next-header -->\n## [Unreleased] - ReleaseDate\n", exactly = 1 },
+]

@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tracing::warn;
 
-use crate::proxy::{box_full, ResBody};
+use crate::proxy::{ResBody, box_full};
 use crate::state::AppState;
 
 #[derive(Serialize)]

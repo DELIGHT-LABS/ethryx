@@ -4,6 +4,8 @@
 //! [`run`] directly with a custom shutdown future to drive the full stack
 //! in-process without spawning a subprocess.
 
+#![forbid(unsafe_code)]
+
 pub mod config;
 mod headers;
 mod health;

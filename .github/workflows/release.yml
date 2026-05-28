@@ -1,0 +1,84 @@
+name: Release
+
+run-name: "Release ${{ github.ref_name }}"
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Verify Cargo.toml version matches tag
+        run: |
+          set -euo pipefail
+          CARGO_VER=$(awk -F\" '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)
+          TAG="${{ github.ref_name }}"
+          if [ "v$CARGO_VER" != "$TAG" ]; then
+            echo "::error::Cargo.toml version $CARGO_VER does not match tag $TAG (expected v$CARGO_VER)"
+            exit 1
+          fi
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            --verify-tag
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      id-token: write       # sigstore attestation
+      attestations: write   # GitHub artifact attestations
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Build & upload static binary
+        id: upload
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: ethryx
+          target: ${{ matrix.target }}
+          archive: ethryx-$tag-$target
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.upload.outputs.archive }}

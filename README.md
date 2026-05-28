@@ -1,5 +1,10 @@
 # ethryx
 
+[![CI](https://github.com/DELIGHT-LABS/ethryx/actions/workflows/ci.yml/badge.svg)](https://github.com/DELIGHT-LABS/ethryx/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/DELIGHT-LABS/ethryx?include_prereleases&sort=semver)](https://github.com/DELIGHT-LABS/ethryx/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust 1.95+](https://img.shields.io/badge/rust-1.95%2B-blue.svg)](rust-toolchain.toml)
+
 Lightweight Rust sidecar that multiplexes HTTP / WebSocket traffic and surfaces
 health for an Ethereum **Execution Layer** (EL) and **Consensus Layer** (CL) pair.
 
@@ -108,11 +113,16 @@ chain: `--network custom --cl-genesis-time <unix> --cl-seconds-per-slot 12`.
 
 ## Development
 
-Git hooks live in `.githooks/`. Enable them once per clone:
+Git hooks live in `.githooks/`. One-time setup per clone:
 
 ```sh
 git config core.hooksPath .githooks
-cargo install cargo-audit --locked   # for pre-push advisory scan
+cargo install --locked \
+    cargo-audit \
+    cargo-deny \
+    cargo-release \
+    cargo-llvm-cov
+# optional: `just` (https://github.com/casey/just) for the shortcuts in justfile
 ```
 
 - `pre-commit` runs `cargo fmt --all -- --check` and `cargo clippy
@@ -121,5 +131,46 @@ cargo install cargo-audit --locked   # for pre-push advisory scan
 - `pre-push` runs `cargo test --locked` plus `cargo audit -D warnings`
   (RustSec advisory DB). The audit step is soft-skipped if `cargo-audit` is
   not installed.
+- Bypass with `--no-verify` only for emergencies.
 
-Bypass with `--no-verify` only for emergencies.
+Common tasks (via `just`):
+
+| Recipe          | Action                                        |
+|-----------------|-----------------------------------------------|
+| `just check`    | fmt + clippy + test + audit (full local gate) |
+| `just fmt`      | `cargo fmt --all`                             |
+| `just deny`     | `cargo deny check` (supply-chain audit)       |
+| `just coverage` | HTML coverage report under `target/llvm-cov/` |
+| `just release`  | `cargo release patch --execute`               |
+
+Open in a devcontainer (VSCode / Codespaces) and `.devcontainer/devcontainer.json`
+installs all of the above plus the cross-compile targets automatically.
+
+## Release
+
+Releases are cut with [`cargo-release`](https://github.com/crate-ci/cargo-release):
+
+```sh
+cargo install cargo-release --locked   # one-time
+
+# Dry-run first to preview
+cargo release patch
+
+# Apply
+cargo release patch --execute   # 0.1.0 → 0.1.1
+# or: cargo release minor --execute     0.1.0 → 0.2.0
+# or: cargo release 0.5.0  --execute    explicit
+```
+
+This runs `cargo test --locked` as a gate, then bumps `Cargo.toml` + `Cargo.lock`,
+commits as `chore: release vX.Y.Z`, tags `vX.Y.Z`, and pushes both. The `v*` tag
+push triggers `.github/workflows/release.yml`, which:
+
+1. Verifies `Cargo.toml` version matches the tag
+2. Creates a GitHub Release with auto-generated notes
+3. Builds static `musl` binaries and attaches them with `.sha256` checksums:
+   - `ethryx-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz`
+   - `ethryx-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz`
+
+`cargo-release` is configured under `[package.metadata.release]` in `Cargo.toml`
+(main-branch only, no crates.io publish, `cargo test --locked` as pre-hook).
