@@ -21,8 +21,7 @@ use crate::state::AppState;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .json()
         .init();
@@ -80,7 +79,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = h.await;
     }
 
-    info!(grace_secs = shutdown_grace.as_secs(), "draining connections");
+    info!(
+        grace_secs = shutdown_grace.as_secs(),
+        "draining connections"
+    );
     tokio::time::sleep(shutdown_grace).await;
     Ok(())
 }

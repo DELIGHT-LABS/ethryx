@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Pre-push hook: cargo test (heavier than pre-commit; runs before remote receives anything).
+# Bypass (emergency only): git push --no-verify
+set -euo pipefail
+
+# Git launches hooks with a minimal PATH; pull in rustup's bin dir.
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+export PATH="$HOME/.cargo/bin:$PATH"
+
+cd "$(git rev-parse --show-toplevel)"
+
+if ! command -v cargo >/dev/null; then
+    echo "✗ cargo not found in PATH; install rustup or skip with --no-verify" >&2
+    exit 1
+fi
+
+echo "→ cargo test --locked"
+if ! cargo test --locked --quiet; then
+    echo >&2
+    echo "✗ tests failed" >&2
+    exit 1
+fi
+
+if command -v cargo-audit >/dev/null; then
+    echo "→ cargo audit -D warnings"
+    if ! cargo audit -D warnings; then
+        echo >&2
+        echo "✗ security advisory match — see https://rustsec.org/advisories/" >&2
+        exit 1
+    fi
+else
+    echo "⚠ cargo-audit not installed; skipping (install: cargo install cargo-audit --locked)" >&2
+fi
+
+echo "✓ pre-push OK"

@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Pre-commit hook: rustfmt + clippy.
+# Bypass (emergency only): git commit --no-verify
+set -euo pipefail
+
+# Git launches hooks with a minimal PATH; pull in rustup's bin dir.
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+export PATH="$HOME/.cargo/bin:$PATH"
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Skip when no Rust / manifest files are staged
+if ! git diff --cached --name-only --diff-filter=ACMR \
+        | grep -qE '(^|/)(.*\.rs|Cargo\.(toml|lock)|rust-toolchain(\.toml)?)$'; then
+    exit 0
+fi
+
+if ! command -v cargo >/dev/null; then
+    echo "✗ cargo not found in PATH; install rustup or skip with --no-verify" >&2
+    exit 1
+fi
+
+echo "→ cargo fmt --all -- --check"
+if ! cargo fmt --all -- --check; then
+    echo >&2
+    echo "✗ formatting drift detected — run: cargo fmt" >&2
+    exit 1
+fi
+
+echo "→ cargo clippy --all-targets -- -D warnings"
+if ! cargo clippy --all-targets --locked -- -D warnings; then
+    echo >&2
+    echo "✗ clippy lints — fix above (or try: cargo clippy --fix --allow-dirty)" >&2
+    exit 1
+fi
+
+echo "✓ pre-commit OK"

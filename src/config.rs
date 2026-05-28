@@ -49,7 +49,11 @@ pub struct Config {
     pub listen: Vec<String>,
 
     /// Execution-layer JSON-RPC over HTTP upstream URL.
-    #[arg(long, env = "ETHRYX_EL_HTTP_URL", default_value = "http://127.0.0.1:8545")]
+    #[arg(
+        long,
+        env = "ETHRYX_EL_HTTP_URL",
+        default_value = "http://127.0.0.1:8545"
+    )]
     pub el_http_url: String,
 
     /// Execution-layer JSON-RPC over WebSocket upstream URL.
@@ -57,7 +61,11 @@ pub struct Config {
     pub el_ws_url: String,
 
     /// Consensus-layer Beacon API upstream URL (REST, /eth/v1/...).
-    #[arg(long, env = "ETHRYX_CL_BEACON_URL", default_value = "http://127.0.0.1:5052")]
+    #[arg(
+        long,
+        env = "ETHRYX_CL_BEACON_URL",
+        default_value = "http://127.0.0.1:5052"
+    )]
     pub cl_beacon_url: String,
 
     /// Beacon network. Selects defaults for cl-genesis-time / cl-seconds-per-slot.
@@ -106,10 +114,9 @@ impl Config {
     pub fn resolve_cl_genesis_time(&self) -> Result<u64, &'static str> {
         match self.cl_genesis_time {
             Some(v) => Ok(v),
-            None => self
-                .network
-                .preset_genesis_time()
-                .ok_or("--network custom requires --cl-genesis-time (use 0 to disable slot-age check)"),
+            None => self.network.preset_genesis_time().ok_or(
+                "--network custom requires --cl-genesis-time (use 0 to disable slot-age check)",
+            ),
         }
     }
 

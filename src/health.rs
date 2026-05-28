@@ -31,10 +31,8 @@ struct ClStatus {
     is_syncing: bool,
 }
 
-const SYNCING_REQ: &[u8] =
-    br#"{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}"#;
-const PEERS_REQ: &[u8] =
-    br#"{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":1}"#;
+const SYNCING_REQ: &[u8] = br#"{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}"#;
+const PEERS_REQ: &[u8] = br#"{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":1}"#;
 const BLOCK_REQ: &[u8] =
     br#"{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["latest",false],"id":1}"#;
 
@@ -48,33 +46,61 @@ pub async fn report(state: &AppState) -> Response<ResBody> {
     );
 
     let el_syncing = match sync_r {
-        Ok(Value::Bool(false)) => Check { ok: true, detail: "synced".into() },
-        Ok(v) => Check { ok: false, detail: format!("syncing: {v}") },
-        Err(e) => Check { ok: false, detail: format!("eth_syncing: {e}") },
+        Ok(Value::Bool(false)) => Check {
+            ok: true,
+            detail: "synced".into(),
+        },
+        Ok(v) => Check {
+            ok: false,
+            detail: format!("syncing: {v}"),
+        },
+        Err(e) => Check {
+            ok: false,
+            detail: format!("eth_syncing: {e}"),
+        },
     };
     let el_peers = match peers_r {
         Ok(Value::String(hex)) => match hex_to_u64(&hex) {
-            Some(n) if n >= state.cfg.el_min_peers => {
-                Check { ok: true, detail: format!("{n} peers") }
-            }
+            Some(n) if n >= state.cfg.el_min_peers => Check {
+                ok: true,
+                detail: format!("{n} peers"),
+            },
             Some(n) => Check {
                 ok: false,
                 detail: format!("{n} peers (min {})", state.cfg.el_min_peers),
             },
-            None => Check { ok: false, detail: format!("invalid hex: {hex}") },
+            None => Check {
+                ok: false,
+                detail: format!("invalid hex: {hex}"),
+            },
         },
-        Ok(v) => Check { ok: false, detail: format!("unexpected: {v}") },
-        Err(e) => Check { ok: false, detail: format!("net_peerCount: {e}") },
+        Ok(v) => Check {
+            ok: false,
+            detail: format!("unexpected: {v}"),
+        },
+        Err(e) => Check {
+            ok: false,
+            detail: format!("net_peerCount: {e}"),
+        },
     };
     let el_block_fresh = match block_r {
         Ok(block) => {
-            let ts = block.get("timestamp").and_then(Value::as_str).and_then(hex_to_u64);
-            let num = block.get("number").and_then(Value::as_str).and_then(hex_to_u64);
+            let ts = block
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(hex_to_u64);
+            let num = block
+                .get("number")
+                .and_then(Value::as_str)
+                .and_then(hex_to_u64);
             match (ts, num) {
                 (Some(t), Some(n)) => {
                     let age = now_unix().saturating_sub(t);
                     if age <= state.cfg.el_max_block_age_secs {
-                        Check { ok: true, detail: format!("block {n}, age {age}s") }
+                        Check {
+                            ok: true,
+                            detail: format!("block {n}, age {age}s"),
+                        }
                     } else {
                         Check {
                             ok: false,
@@ -85,22 +111,37 @@ pub async fn report(state: &AppState) -> Response<ResBody> {
                         }
                     }
                 }
-                _ => Check { ok: false, detail: "block missing fields".into() },
+                _ => Check {
+                    ok: false,
+                    detail: "block missing fields".into(),
+                },
             }
         }
-        Err(e) => Check { ok: false, detail: format!("eth_getBlockByNumber: {e}") },
+        Err(e) => Check {
+            ok: false,
+            detail: format!("eth_getBlockByNumber: {e}"),
+        },
     };
 
     let cl_syncing = match &cl_status_r {
         Ok(s) if !s.is_syncing => Check {
             ok: true,
-            detail: format!("synced (slot {}, distance {})", s.head_slot, s.sync_distance),
+            detail: format!(
+                "synced (slot {}, distance {})",
+                s.head_slot, s.sync_distance
+            ),
         },
         Ok(s) => Check {
             ok: false,
-            detail: format!("syncing (slot {}, distance {})", s.head_slot, s.sync_distance),
+            detail: format!(
+                "syncing (slot {}, distance {})",
+                s.head_slot, s.sync_distance
+            ),
         },
-        Err(e) => Check { ok: false, detail: format!("syncing: {e}") },
+        Err(e) => Check {
+            ok: false,
+            detail: format!("syncing: {e}"),
+        },
     };
     let cl_peers = match cl_peers_r {
         Ok(n) if n >= state.cfg.cl_min_peers => Check {
@@ -111,7 +152,10 @@ pub async fn report(state: &AppState) -> Response<ResBody> {
             ok: false,
             detail: format!("{n} peers (min {})", state.cfg.cl_min_peers),
         },
-        Err(e) => Check { ok: false, detail: format!("peer_count: {e}") },
+        Err(e) => Check {
+            ok: false,
+            detail: format!("peer_count: {e}"),
+        },
     };
     let cl_slot_fresh = match &cl_status_r {
         Ok(s) if state.cl_genesis_time == 0 => Check {
@@ -119,8 +163,7 @@ pub async fn report(state: &AppState) -> Response<ResBody> {
             detail: format!("slot {} (age check disabled)", s.head_slot),
         },
         Ok(s) => {
-            let expected =
-                state.cl_genesis_time + s.head_slot * state.cl_seconds_per_slot;
+            let expected = state.cl_genesis_time + s.head_slot * state.cl_seconds_per_slot;
             let age = now_unix().saturating_sub(expected);
             if age <= state.cfg.cl_max_slot_age_secs {
                 Check {
@@ -137,7 +180,10 @@ pub async fn report(state: &AppState) -> Response<ResBody> {
                 }
             }
         }
-        Err(e) => Check { ok: false, detail: format!("slot age: {e}") },
+        Err(e) => Check {
+            ok: false,
+            detail: format!("slot age: {e}"),
+        },
     };
 
     let all_ok = el_syncing.ok
@@ -168,7 +214,11 @@ pub async fn report(state: &AppState) -> Response<ResBody> {
         cl_slot_fresh,
     };
     let body_bytes = serde_json::to_vec(&report).unwrap_or_else(|_| b"{}".to_vec());
-    let code = if all_ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let code = if all_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
 
     Response::builder()
         .status(code)
@@ -204,7 +254,9 @@ async fn el_rpc(state: &AppState, payload: Bytes) -> Result<Value, String> {
     if let Some(err) = v.get("error") {
         return Err(format!("rpc error: {err}"));
     }
-    v.get("result").cloned().ok_or_else(|| "missing result".into())
+    v.get("result")
+        .cloned()
+        .ok_or_else(|| "missing result".into())
 }
 
 async fn cl_syncing_status(state: &AppState) -> Result<ClStatus, String> {
@@ -217,7 +269,11 @@ async fn cl_syncing_status(state: &AppState) -> Result<ClStatus, String> {
     let head_slot = parse_decimal_str(data.get("head_slot")).ok_or("missing head_slot")?;
     let sync_distance =
         parse_decimal_str(data.get("sync_distance")).ok_or("missing sync_distance")?;
-    Ok(ClStatus { head_slot, sync_distance, is_syncing })
+    Ok(ClStatus {
+        head_slot,
+        sync_distance,
+        is_syncing,
+    })
 }
 
 async fn cl_peer_count(state: &AppState) -> Result<u64, String> {
@@ -252,7 +308,8 @@ async fn cl_get_json(state: &AppState, uri: &Uri) -> Result<Value, String> {
 }
 
 fn parse_decimal_str(v: Option<&Value>) -> Option<u64> {
-    v.and_then(Value::as_str).and_then(|s| s.parse::<u64>().ok())
+    v.and_then(Value::as_str)
+        .and_then(|s| s.parse::<u64>().ok())
 }
 
 fn hex_to_u64(s: &str) -> Option<u64> {

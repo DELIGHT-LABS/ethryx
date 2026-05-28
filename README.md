@@ -105,3 +105,21 @@ WantedBy=multi-user.target
 
 For testnets, set `--network hoodi` (or `sepolia` / `holesky`). For a private
 chain: `--network custom --cl-genesis-time <unix> --cl-seconds-per-slot 12`.
+
+## Development
+
+Git hooks live in `.githooks/`. Enable them once per clone:
+
+```sh
+git config core.hooksPath .githooks
+cargo install cargo-audit --locked   # for pre-push advisory scan
+```
+
+- `pre-commit` runs `cargo fmt --all -- --check` and `cargo clippy
+  --all-targets --locked -- -D warnings` (skipped when the commit touches no
+  Rust / `Cargo.*` / `rust-toolchain*` files).
+- `pre-push` runs `cargo test --locked` plus `cargo audit -D warnings`
+  (RustSec advisory DB). The audit step is soft-skipped if `cargo-audit` is
+  not installed.
+
+Bypass with `--no-verify` only for emergencies.
