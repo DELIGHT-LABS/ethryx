@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+### Changed
+
+- `/health` top-level `status` value is now `"healthy"` / `"unhealthy"` (was
+  `"ok"` / `"unhealthy"`, asymmetric).
+- `/health` EL syncing detail parses `currentBlock` / `highestBlock` from
+  `eth_syncing` and renders as `"syncing (block X, distance Y)"`, mirroring
+  the CL `"syncing (slot S, distance D)"` format.
+- `/health` CL check errors now prefix with the Beacon API endpoint path
+  (`node/syncing: ...`, `node/peer_count: ...`) to disambiguate against the
+  literal `syncing` status word.
+- Env vars for the two `*-age-secs` flags gained the missing `_SECS` suffix
+  (`ETHRYX_EL_MAX_BLOCK_AGE` → `ETHRYX_EL_MAX_BLOCK_AGE_SECS`,
+  `ETHRYX_CL_MAX_SLOT_AGE` → `ETHRYX_CL_MAX_SLOT_AGE_SECS`) so the env name
+  matches its CLI flag.
+
 ## [0.1.0] - 2026-05-28
 
 ### Added

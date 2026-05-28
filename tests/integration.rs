@@ -412,7 +412,7 @@ async fn health_200_when_everything_green() {
         StatusCode::OK,
         "expected /health 200, got {status}: {v}"
     );
-    assert_eq!(v["status"], "ok");
+    assert_eq!(v["status"], "healthy");
     assert_eq!(v["el_syncing"]["ok"], true);
     assert_eq!(v["el_peers"]["ok"], true);
     assert_eq!(v["el_block_fresh"]["ok"], true);

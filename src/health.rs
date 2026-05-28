@@ -50,10 +50,24 @@ pub async fn report(state: &AppState) -> Response<ResBody> {
             ok: true,
             detail: "synced".into(),
         },
-        Ok(v) => Check {
-            ok: false,
-            detail: format!("syncing: {v}"),
-        },
+        Ok(v) => {
+            let current = v
+                .get("currentBlock")
+                .and_then(Value::as_str)
+                .and_then(hex_to_u64);
+            let highest = v
+                .get("highestBlock")
+                .and_then(Value::as_str)
+                .and_then(hex_to_u64);
+            let detail = match (current, highest) {
+                (Some(c), Some(h)) => {
+                    let distance = h.saturating_sub(c);
+                    format!("syncing (block {c}, distance {distance})")
+                }
+                _ => format!("syncing: {v}"),
+            };
+            Check { ok: false, detail }
+        }
         Err(e) => Check {
             ok: false,
             detail: format!("eth_syncing: {e}"),
@@ -140,7 +154,7 @@ pub async fn report(state: &AppState) -> Response<ResBody> {
         },
         Err(e) => Check {
             ok: false,
-            detail: format!("syncing: {e}"),
+            detail: format!("node/syncing: {e}"),
         },
     };
     let cl_peers = match cl_peers_r {
@@ -154,7 +168,7 @@ pub async fn report(state: &AppState) -> Response<ResBody> {
         },
         Err(e) => Check {
             ok: false,
-            detail: format!("peer_count: {e}"),
+            detail: format!("node/peer_count: {e}"),
         },
     };
     let cl_slot_fresh = match &cl_status_r {
@@ -182,7 +196,7 @@ pub async fn report(state: &AppState) -> Response<ResBody> {
         }
         Err(e) => Check {
             ok: false,
-            detail: format!("slot age: {e}"),
+            detail: format!("node/syncing: {e}"),
         },
     };
 
@@ -205,7 +219,7 @@ pub async fn report(state: &AppState) -> Response<ResBody> {
     }
 
     let report = Report {
-        status: if all_ok { "ok" } else { "unhealthy" },
+        status: if all_ok { "healthy" } else { "unhealthy" },
         el_syncing,
         el_peers,
         el_block_fresh,

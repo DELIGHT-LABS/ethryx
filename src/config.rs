@@ -78,7 +78,7 @@ pub struct Config {
     pub el_min_peers: u64,
 
     /// Maximum EL block age in seconds before /health reports stale.
-    #[arg(long, env = "ETHRYX_EL_MAX_BLOCK_AGE", default_value_t = 60)]
+    #[arg(long, env = "ETHRYX_EL_MAX_BLOCK_AGE_SECS", default_value_t = 60)]
     pub el_max_block_age_secs: u64,
 
     /// Minimum acceptable CL peer count (Beacon /eth/v1/node/peer_count `connected`).
@@ -86,7 +86,7 @@ pub struct Config {
     pub cl_min_peers: u64,
 
     /// Maximum CL head_slot age in seconds (wall-clock).
-    #[arg(long, env = "ETHRYX_CL_MAX_SLOT_AGE", default_value_t = 60)]
+    #[arg(long, env = "ETHRYX_CL_MAX_SLOT_AGE_SECS", default_value_t = 60)]
     pub cl_max_slot_age_secs: u64,
 
     /// Beacon-chain genesis Unix timestamp. Overrides --network preset. Set 0 to disable slot-age check.
