@@ -88,13 +88,14 @@ Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/ethryx \
+  --network mainnet \
   --listen 0.0.0.0:8547 \
   --el-http-url   http://127.0.0.1:8545 \
   --el-ws-url     ws://127.0.0.1:8546 \
   --cl-beacon-url http://127.0.0.1:5052 \
-  --el-min-peers 3 \
+  --el-min-peers 8 \
   --el-max-block-age-secs 60 \
-  --cl-min-peers 16 \
+  --cl-min-peers 8 \
   --cl-max-slot-age-secs 60
 Restart=on-failure
 RestartSec=2
@@ -110,6 +111,19 @@ WantedBy=multi-user.target
 
 For testnets, set `--network hoodi` (or `sepolia` / `holesky`). For a private
 chain: `--network custom --cl-genesis-time <unix> --cl-seconds-per-slot 12`.
+
+### Threshold tuning
+
+Defaults are chosen to fire only on **clearly degraded** state (lower
+false-positive on k8s probes); not as tight as production alerting tooling.
+Recommended adjustments:
+
+| Scenario                              | `--el-min-peers` | `--cl-min-peers` | `--*-age-secs` |
+|---------------------------------------|------------------|------------------|----------------|
+| Default (balanced, both layers ≈ 8 %) | `8`              | `8`              | `60`           |
+| Mainnet, production-tight             | `16` – `32`      | `16` – `32`      | `60`           |
+| Hoodi / Sepolia / Holesky, early days | `4`              | `4`              | `120`          |
+| Private / low-peer chain              | `2`              | `2`              | tune to slot   |
 
 ## Development
 

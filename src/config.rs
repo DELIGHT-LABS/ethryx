@@ -74,7 +74,7 @@ pub struct Config {
     pub network: Network,
 
     /// Minimum acceptable EL peer count (net_peerCount) for /health.
-    #[arg(long, env = "ETHRYX_EL_MIN_PEERS", default_value_t = 3)]
+    #[arg(long, env = "ETHRYX_EL_MIN_PEERS", default_value_t = 8)]
     pub el_min_peers: u64,
 
     /// Maximum EL block age in seconds before /health reports stale.
