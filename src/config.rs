@@ -73,21 +73,28 @@ pub struct Config {
     #[arg(long, env = "ETHRYX_NETWORK", value_enum, default_value_t = Network::Mainnet)]
     pub network: Network,
 
-    /// Minimum acceptable EL peer count (net_peerCount) for /health.
-    #[arg(long, env = "ETHRYX_EL_MIN_PEERS", default_value_t = 8)]
-    pub el_min_peers: u64,
-
-    /// Maximum EL block age in seconds before /health reports stale.
+    /// Maximum EL block age (seconds) used to gate `/readyz` under
+    /// `--readyz-strict`. `/healthz` always reports the raw age regardless.
     #[arg(long, env = "ETHRYX_EL_MAX_BLOCK_AGE_SECS", default_value_t = 60)]
     pub el_max_block_age_secs: u64,
 
-    /// Minimum acceptable CL peer count (Beacon /eth/v1/node/peer_count `connected`).
-    #[arg(long, env = "ETHRYX_CL_MIN_PEERS", default_value_t = 8)]
-    pub cl_min_peers: u64,
-
-    /// Maximum CL head_slot age in seconds (wall-clock).
+    /// Maximum CL head_slot age (seconds, wall-clock) used to gate `/readyz`
+    /// under `--readyz-strict`. `/healthz` always reports the raw age regardless.
     #[arg(long, env = "ETHRYX_CL_MAX_SLOT_AGE_SECS", default_value_t = 60)]
     pub cl_max_slot_age_secs: u64,
+
+    /// Also gate `/readyz` on EL block / CL slot freshness, not just sync status.
+    /// Off by default so a network-wide stall (or a peer dip) does not drain the
+    /// whole fleet from the load balancer at once.
+    #[arg(
+        long,
+        env = "ETHRYX_READYZ_STRICT",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub readyz_strict: bool,
 
     /// Beacon-chain genesis Unix timestamp. Overrides --network preset. Set 0 to disable slot-age check.
     #[arg(long, env = "ETHRYX_CL_GENESIS_TIME")]
@@ -97,7 +104,7 @@ pub struct Config {
     #[arg(long, env = "ETHRYX_CL_SECONDS_PER_SLOT")]
     pub cl_seconds_per_slot: Option<u64>,
 
-    /// Upstream timeout for health-check RPCs (seconds).
+    /// Upstream timeout for `/healthz` and `/readyz` probe RPCs (seconds).
     #[arg(long, env = "ETHRYX_HEALTH_TIMEOUT", default_value = "3", value_parser = parse_secs)]
     pub health_timeout: Duration,
 
@@ -224,6 +231,22 @@ mod tests {
         let cfg = parse(&["--listen", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3"]);
         assert_eq!(cfg.listen.len(), 3);
         assert_eq!(cfg.listen[2], "127.0.0.1:3");
+    }
+
+    #[test]
+    fn readyz_strict_defaults_off() {
+        assert!(!parse(&[]).readyz_strict);
+    }
+
+    #[test]
+    fn readyz_strict_bare_flag_enables() {
+        assert!(parse(&["--readyz-strict"]).readyz_strict);
+    }
+
+    #[test]
+    fn readyz_strict_accepts_explicit_bool() {
+        assert!(parse(&["--readyz-strict", "true"]).readyz_strict);
+        assert!(!parse(&["--readyz-strict", "false"]).readyz_strict);
     }
 
     #[test]

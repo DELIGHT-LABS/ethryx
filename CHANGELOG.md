@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+### Added
+
+- `/readyz` readiness probe and `/healthz` state snapshot, joining `/livez` as a
+  three-tier probe model (liveness / readiness / monitoring), following the
+  Kubernetes `livez` / `readyz` / `healthz` convention.
+  - `/readyz` is the load-balancer traffic gate. It gates on EL + CL **sync
+    status** only, so a network-wide stall (or a fleet-wide peer dip) does not
+    drain every backend out of rotation at once. `--readyz-strict`
+    (`ETHRYX_READYZ_STRICT`) additionally gates on EL block / CL slot freshness.
+  - `/healthz` is verdict-free: it always returns `200` and reports each live
+    EL/CL value as a machine-readable numeric field (peer counts, block / slot
+    age, sync status) under `el` / `cl`, with any upstream failure recorded in a
+    per-layer `errors` array — leaving thresholding and alerting to the consumer.
+
+### Removed
+
+- `--el-min-peers` / `--cl-min-peers` (`ETHRYX_EL_MIN_PEERS` /
+  `ETHRYX_CL_MIN_PEERS`): peer count no longer gates any endpoint. `/readyz`
+  gates on sync status; `/healthz` reports the raw peer count for the monitoring
+  layer to threshold. The `--*-max-*-age-secs` flags are retained but now gate
+  `/readyz` under `--readyz-strict` rather than a health verdict.
+
 ## [0.1.1] - 2026-05-28
 
 ### Changed

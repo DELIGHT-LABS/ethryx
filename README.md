@@ -12,29 +12,74 @@ health for an Ethereum **Execution Layer** (EL) and **Consensus Layer** (CL) pai
 
 | Request                              | Forwarded to        |
 |--------------------------------------|---------------------|
-| `GET /health`                        | EL + CL health aggregate |
 | `GET /livez`                         | 200 OK (process liveness) |
+| `GET /readyz`                        | EL + CL readiness gate (200 / 503) |
+| `GET /healthz`                       | EL + CL state snapshot (always 200) |
 | `/eth/...` (Beacon API)              | `--cl-beacon-url`   |
 | `Upgrade: websocket`                 | `--el-ws-url`       |
 | everything else (JSON-RPC `POST /`)  | `--el-http-url`     |
 
-## Health checks
+## Probes
 
-`/health` returns 200 + JSON when all are green, else 503:
+Three endpoints, split by purpose (Kubernetes `z` convention):
 
-| Field            | Source                                  | Threshold flag                |
-|------------------|-----------------------------------------|-------------------------------|
-| `el_syncing`     | EL `eth_syncing`                        | —                             |
-| `el_peers`       | EL `net_peerCount`                      | `--el-min-peers`              |
-| `el_block_fresh` | EL `eth_getBlockByNumber("latest")`     | `--el-max-block-age-secs`     |
-| `cl_syncing`     | Beacon `/eth/v1/node/syncing`           | —                             |
-| `cl_peers`       | Beacon `/eth/v1/node/peer_count`        | `--cl-min-peers`              |
-| `cl_slot_fresh`  | Beacon head_slot vs. wall-clock         | `--cl-max-slot-age-secs`      |
+| Endpoint       | Returns                       | Wire to                     | Gates on                                              |
+|----------------|-------------------------------|-----------------------------|-------------------------------------------------------|
+| `GET /livez`   | always `200`, body `ok`       | liveness probe (restart)    | nothing — only that the process is up; no upstream call |
+| `GET /readyz`  | `200` ready / `503` not ready | readiness probe (LB gate)   | EL + CL **sync status** (plus freshness with `--readyz-strict`) |
+| `GET /healthz` | always `200` + JSON snapshot  | monitoring / alerting / curl | nothing — reports state, never judges                 |
 
-CL slot freshness is derived from `head_slot * --cl-seconds-per-slot +
---cl-genesis-time`. Use `--network <name>` to pick a preset (defaults to
-mainnet) instead of typing both. Set `--cl-genesis-time 0` to skip the
-slot-age check entirely.
+`/livez` and `/readyz` differ exactly when the node is up but not serving yet
+(startup, mid-sync, or an upstream is down): `/livez` stays `200` (don't restart
+me) while `/readyz` returns `503` (don't route to me). Once synced, both are
+`200`. So **default `/readyz` is `/livez` plus an EL+CL sync check.**
+
+### `/readyz` — the traffic gate
+
+Gates **only on EL + CL sync status** by default. A caught-up node reports
+`eth_syncing == false` even when the chain stalls network-wide, so a chain
+incident (or a fleet-wide peer dip) won't drop every backend out of the load
+balancer at once — which would turn a chain incident into a total RPC outage.
+Sync status is the node-local signal that tells "this node can serve" apart from
+"this node is behind its peers".
+
+```jsonc
+// 200 — synced. el_block_fresh / cl_slot_fresh appear only under --readyz-strict.
+{ "status": "ready",
+  "el_syncing": { "ok": true, "detail": "synced" },
+  "cl_syncing": { "ok": true, "detail": "synced (slot 9412341, distance 0)" } }
+```
+
+`--readyz-strict` additionally gates on EL block age (`--el-max-block-age-secs`)
+and CL slot age (`--cl-max-slot-age-secs`) — choose it when serving strictly
+at-head data matters more than fleet availability during a stall.
+
+### `/healthz` — state for monitoring
+
+Always `200`. Reports each live EL/CL value as a machine-readable field for your
+monitoring stack to threshold; it applies no thresholds and renders no verdict.
+A signal whose upstream call failed is omitted and the error is recorded under
+that layer's `errors` array.
+
+| Field                                              | Source                                |
+|----------------------------------------------------|---------------------------------------|
+| `el.syncing` (`false` = synced)                    | EL `eth_syncing`                      |
+| `el.sync_distance` (while syncing)                 | EL `eth_syncing` highest − current    |
+| `el.peers`                                         | EL `net_peerCount`                    |
+| `el.block_number` / `el.block_age_secs`            | EL `eth_getBlockByNumber("latest")`   |
+| `cl.syncing` / `cl.sync_distance` / `cl.head_slot` | Beacon `/eth/v1/node/syncing`         |
+| `cl.slot_age_secs`                                 | Beacon `head_slot` vs. wall-clock     |
+| `cl.peers`                                         | Beacon `/eth/v1/node/peer_count`      |
+| `el.errors` / `cl.errors`                          | any upstream call that failed         |
+
+```json
+{ "el": { "syncing": false, "peers": 23, "block_number": 21000000, "block_age_secs": 5 },
+  "cl": { "syncing": false, "sync_distance": 0, "peers": 78, "head_slot": 9412341, "slot_age_secs": 3 } }
+```
+
+CL slot age is derived from `head_slot * --cl-seconds-per-slot +
+--cl-genesis-time`. Use `--network <name>` for a preset (defaults to mainnet)
+instead of typing both; `--cl-genesis-time 0` omits `cl.slot_age_secs`.
 
 | `--network` | genesis_time   | seconds_per_slot |
 |-------------|----------------|------------------|
@@ -92,11 +137,7 @@ ExecStart=/usr/local/bin/ethryx \
   --listen 0.0.0.0:8547 \
   --el-http-url   http://127.0.0.1:8545 \
   --el-ws-url     ws://127.0.0.1:8546 \
-  --cl-beacon-url http://127.0.0.1:5052 \
-  --el-min-peers 8 \
-  --el-max-block-age-secs 60 \
-  --cl-min-peers 8 \
-  --cl-max-slot-age-secs 60
+  --cl-beacon-url http://127.0.0.1:5052
 Restart=on-failure
 RestartSec=2
 User=ethryx
@@ -112,18 +153,22 @@ WantedBy=multi-user.target
 For testnets, set `--network hoodi` (or `sepolia` / `holesky`). For a private
 chain: `--network custom --cl-genesis-time <unix> --cl-seconds-per-slot 12`.
 
-### Threshold tuning
+### Readiness tuning
 
-Defaults are chosen to fire only on **clearly degraded** state (lower
-false-positive on k8s probes); not as tight as production alerting tooling.
-Recommended adjustments:
+`/readyz` is sync-only by default and needs no tuning — it tracks whether the
+node is caught up to its peers. Add `--readyz-strict` if you also want it to
+fail when the node stops advancing at head; freshness then gates on:
 
-| Scenario                              | `--el-min-peers` | `--cl-min-peers` | `--*-age-secs` |
-|---------------------------------------|------------------|------------------|----------------|
-| Default (balanced, both layers ≈ 8 %) | `8`              | `8`              | `60`           |
-| Mainnet, production-tight             | `16` – `32`      | `16` – `32`      | `60`           |
-| Hoodi / Sepolia / Holesky, early days | `4`              | `4`              | `120`          |
-| Private / low-peer chain              | `2`              | `2`              | tune to slot   |
+| Flag                      | Default | Gates `/readyz` on            |
+|---------------------------|---------|-------------------------------|
+| `--el-max-block-age-secs` | `60`    | EL latest-block wall-clock age |
+| `--cl-max-slot-age-secs`  | `60`    | CL head-slot wall-clock age    |
+
+These two flags are inert without `--readyz-strict`; `/healthz` always reports
+the raw age regardless. On young testnets or low-traffic private chains, widen
+them (e.g. `120`) so normal slot gaps don't flap readiness. Peer counts no
+longer gate anything — `/healthz` simply reports the live count for your
+monitoring stack to threshold.
 
 ## Development
 

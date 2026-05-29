@@ -49,8 +49,11 @@ pub async fn dispatch(
 async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResBody>, BoxError> {
     if req.method() == Method::GET {
         let path = req.uri().path();
-        if path == "/health" {
+        if path == "/healthz" {
             return Ok(health::report(state).await);
+        }
+        if path == "/readyz" {
+            return Ok(health::ready(state).await);
         }
         if path == "/livez" {
             return Ok(text_response(StatusCode::OK, Bytes::from_static(b"ok")));

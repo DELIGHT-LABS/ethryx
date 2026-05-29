@@ -1,6 +1,6 @@
 //! Integration tests: spawn ethryx in-process against a hyper-based mock
-//! upstream, drive the full HTTP/proxy/health flow with the same hyper-util
-//! Client used in production code. Zero extra dev-dependencies.
+//! upstream, driving the full proxy / readiness / health flow with the same
+//! hyper-util Client used in production code. Zero extra dev-dependencies.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -323,26 +323,43 @@ async fn hop_by_hop_headers_are_stripped_on_forward() {
 }
 
 #[tokio::test]
-async fn health_503_when_upstreams_404() {
-    // Both mocks return 404 for everything: every probe fails.
+async fn healthz_is_200_even_when_upstreams_fail() {
+    // Both mocks return 404 for everything: every probe errors. /healthz reports
+    // state, it does not judge it, so it still answers 200 with the errors inline.
     let bad: MockHandler = Arc::new(|_| (StatusCode::NOT_FOUND, b"{}".to_vec()));
     let el = MockServer::start(bad.clone()).await;
     let cl = MockServer::start(bad).await;
     let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
 
     let c = client();
-    let (status, body) = get(&c, &ethryx.url("/health")).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let (status, body) = get(&c, &ethryx.url("/healthz")).await;
+    assert_eq!(status, StatusCode::OK);
     let v: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["status"], "unhealthy");
-    assert_eq!(v["el_syncing"]["ok"], false);
-    assert_eq!(v["cl_syncing"]["ok"], false);
+    // No verdict field; each failed upstream is recorded under its layer's errors.
+    assert!(
+        v.get("status").is_none(),
+        "healthz must not render a verdict"
+    );
+    let el_errors = v["el"]["errors"].as_array().expect("el.errors array");
+    assert!(
+        el_errors
+            .iter()
+            .any(|e| e.as_str().unwrap().contains("404")),
+        "got {v}"
+    );
+    let cl_errors = v["cl"]["errors"].as_array().expect("cl.errors array");
+    assert!(
+        cl_errors
+            .iter()
+            .any(|e| e.as_str().unwrap().contains("404")),
+        "got {v}"
+    );
 
     ethryx.shutdown().await;
 }
 
 #[tokio::test]
-async fn health_200_when_everything_green() {
+async fn healthz_reports_numeric_state() {
     let now = now_unix();
     let block_ts_hex = format!("0x{:x}", now - 5);
     // Choose a head_slot that puts the wall-clock age within the default 60s threshold.
@@ -405,20 +422,168 @@ async fn health_200_when_everything_green() {
     .await;
 
     let c = client();
-    let (status, body) = get(&c, &ethryx.url("/health")).await;
+    let (status, body) = get(&c, &ethryx.url("/healthz")).await;
     let v: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(
         status,
         StatusCode::OK,
-        "expected /health 200, got {status}: {v}"
+        "expected /healthz 200, got {status}: {v}"
     );
-    assert_eq!(v["status"], "healthy");
+    // Verdict-free: machine-readable numeric fields, no `ok` / `status`.
+    assert!(
+        v.get("status").is_none(),
+        "healthz must not render a verdict"
+    );
+    assert_eq!(v["el"]["syncing"], false);
+    assert_eq!(v["el"]["peers"], 16);
+    assert!(v["el"]["block_number"].is_number(), "got {v}");
+    assert!(v["el"]["block_age_secs"].is_number(), "got {v}");
+    assert_eq!(v["cl"]["syncing"], false);
+    assert_eq!(v["cl"]["peers"], 100);
+    assert!(v["cl"]["head_slot"].is_number(), "got {v}");
+    assert!(v["cl"]["slot_age_secs"].is_number(), "got {v}");
+
+    ethryx.shutdown().await;
+}
+
+#[tokio::test]
+async fn readyz_ready_when_synced_even_if_degraded() {
+    // Synced EL + CL, but zero peers and a stale block. Default /readyz gates on
+    // sync only, so the node stays ready; /healthz still surfaces the degraded
+    // numbers. This is the whole point of the split.
+    let el = MockServer::start(Arc::new(|req| {
+        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+        let result = match method {
+            "eth_syncing" => json!(false),
+            "net_peerCount" => json!("0x0"),
+            "eth_getBlockByNumber" => json!({"number": "0x1", "timestamp": "0x1"}),
+            _ => json!(null),
+        };
+        let resp = json!({"jsonrpc": "2.0", "id": 1, "result": result});
+        (StatusCode::OK, serde_json::to_vec(&resp).unwrap())
+    }))
+    .await;
+    let cl = MockServer::start(Arc::new(|req| match req.path.as_str() {
+        "/eth/v1/node/syncing" => (
+            StatusCode::OK,
+            serde_json::to_vec(&json!({
+                "data": {"head_slot": "1", "sync_distance": "0", "is_syncing": false}
+            }))
+            .unwrap(),
+        ),
+        "/eth/v1/node/peer_count" => (
+            StatusCode::OK,
+            serde_json::to_vec(&json!({"data": {"connected": "0"}})).unwrap(),
+        ),
+        _ => (StatusCode::NOT_FOUND, b"{}".to_vec()),
+    }))
+    .await;
+    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+
+    let c = client();
+    let (status, body) = get(&c, &ethryx.url("/readyz")).await;
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, StatusCode::OK, "expected ready, got {status}: {v}");
+    assert_eq!(v["status"], "ready");
     assert_eq!(v["el_syncing"]["ok"], true);
-    assert_eq!(v["el_peers"]["ok"], true);
-    assert_eq!(v["el_block_fresh"]["ok"], true);
     assert_eq!(v["cl_syncing"]["ok"], true);
-    assert_eq!(v["cl_peers"]["ok"], true);
-    assert_eq!(v["cl_slot_fresh"]["ok"], true);
+    // Default mode omits freshness/peers entirely.
+    assert!(v.get("el_block_fresh").is_none(), "got {v}");
+    assert!(v.get("cl_slot_fresh").is_none(), "got {v}");
+    assert!(v.get("el_peers").is_none(), "got {v}");
+
+    // /healthz reflects the degraded state without affecting readiness.
+    let (hstatus, hbody) = get(&c, &ethryx.url("/healthz")).await;
+    let hv: Value = serde_json::from_slice(&hbody).unwrap();
+    assert_eq!(hstatus, StatusCode::OK);
+    assert_eq!(hv["el"]["peers"], 0);
+    assert_eq!(hv["cl"]["peers"], 0);
+
+    ethryx.shutdown().await;
+}
+
+#[tokio::test]
+async fn readyz_not_ready_when_el_syncing() {
+    let el = MockServer::start(Arc::new(|req| {
+        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+        let result = match method {
+            "eth_syncing" => json!({"currentBlock": "0x10", "highestBlock": "0x20"}),
+            _ => json!(null),
+        };
+        let resp = json!({"jsonrpc": "2.0", "id": 1, "result": result});
+        (StatusCode::OK, serde_json::to_vec(&resp).unwrap())
+    }))
+    .await;
+    let cl = MockServer::start(Arc::new(|req| match req.path.as_str() {
+        "/eth/v1/node/syncing" => (
+            StatusCode::OK,
+            serde_json::to_vec(&json!({
+                "data": {"head_slot": "100", "sync_distance": "0", "is_syncing": false}
+            }))
+            .unwrap(),
+        ),
+        _ => (StatusCode::NOT_FOUND, b"{}".to_vec()),
+    }))
+    .await;
+    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+
+    let c = client();
+    let (status, body) = get(&c, &ethryx.url("/readyz")).await;
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "got {v}");
+    assert_eq!(v["status"], "not_ready");
+    assert_eq!(v["el_syncing"]["ok"], false);
+    assert_eq!(v["el_syncing"]["detail"], "syncing (block 16, distance 16)");
+
+    ethryx.shutdown().await;
+}
+
+#[tokio::test]
+async fn readyz_strict_gates_on_freshness() {
+    // Synced, but the latest block is ancient. Default /readyz would be ready;
+    // --readyz-strict pulls it because freshness fails.
+    let el = MockServer::start(Arc::new(|req| {
+        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+        let result = match method {
+            "eth_syncing" => json!(false),
+            "eth_getBlockByNumber" => json!({"number": "0x5", "timestamp": "0x1"}),
+            _ => json!(null),
+        };
+        let resp = json!({"jsonrpc": "2.0", "id": 1, "result": result});
+        (StatusCode::OK, serde_json::to_vec(&resp).unwrap())
+    }))
+    .await;
+    let cl = MockServer::start(Arc::new(|req| match req.path.as_str() {
+        "/eth/v1/node/syncing" => (
+            StatusCode::OK,
+            serde_json::to_vec(&json!({
+                "data": {"head_slot": "1", "sync_distance": "0", "is_syncing": false}
+            }))
+            .unwrap(),
+        ),
+        _ => (StatusCode::NOT_FOUND, b"{}".to_vec()),
+    }))
+    .await;
+    let ethryx = EthryxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl.url,
+        "--readyz-strict",
+    ])
+    .await;
+
+    let c = client();
+    let (status, body) = get(&c, &ethryx.url("/readyz")).await;
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "got {v}");
+    assert_eq!(v["status"], "not_ready");
+    // Sync is fine; freshness is what fails, and it is now present in the report.
+    assert_eq!(v["el_syncing"]["ok"], true);
+    assert_eq!(v["el_block_fresh"]["ok"], false);
 
     ethryx.shutdown().await;
 }
