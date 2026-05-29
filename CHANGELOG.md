@@ -47,6 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layer to threshold. The `--*-max-*-age-secs` flags are retained but now gate
   `/readyz` under `--readyz-strict` rather than a health verdict.
 
+### Fixed
+
+- The accept loop now backs off briefly after a failed `accept()` instead of
+  retrying immediately, so a persistent error (e.g. file-descriptor exhaustion)
+  no longer busy-spins a core.
+
 ## [0.1.1] - 2026-05-28
 
 ### Changed

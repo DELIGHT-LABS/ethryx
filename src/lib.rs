@@ -16,6 +16,7 @@ pub use config::Config;
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
@@ -125,6 +126,9 @@ async fn accept_loop(
                     Ok(x) => x,
                     Err(e) => {
                         warn!(error = %e, "accept failed");
+                        // Back off so a persistent error (e.g. fd exhaustion)
+                        // doesn't busy-spin a core retrying immediately.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
                 };
