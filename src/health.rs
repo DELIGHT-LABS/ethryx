@@ -151,7 +151,7 @@ pub fn report(state: &AppState) -> Response<ResBody> {
 /// more than fleet availability during a network-wide stall.
 pub fn ready(state: &AppState) -> Response<ResBody> {
     let probe = state.probe.borrow().clone();
-    let report = evaluate_ready(state, &probe, now_unix());
+    let report = evaluate_ready(state, &probe);
     let code = if report.status == "ready" {
         StatusCode::OK
     } else {
@@ -163,10 +163,13 @@ pub fn ready(state: &AppState) -> Response<ResBody> {
 /// Build the `/readyz` verdict from a probe snapshot. Default gates on EL + CL
 /// sync only; `--readyz-strict` also gates on block / slot freshness. Shared by
 /// the endpoint and the poller's transition logging.
-fn evaluate_ready(state: &AppState, probe: &Probe, now: u64) -> ReadyReport {
+fn evaluate_ready(state: &AppState, probe: &Probe) -> ReadyReport {
     let el_syncing = check_el_syncing(&probe.el_syncing);
     let cl_syncing = check_cl_syncing(&probe.cl_status);
+    // `now` is only needed for the strict freshness checks; the default
+    // sync-only path doesn't read the clock.
     let (el_block_fresh, cl_slot_fresh) = if state.cfg.readyz_strict {
+        let now = now_unix();
         (
             Some(check_el_block_fresh(
                 &probe.el_block,
@@ -261,7 +264,7 @@ pub(crate) async fn poll_loop(
             probe = probe_once(&state) => probe,
         };
 
-        let report = evaluate_ready(&state, &probe, now_unix());
+        let report = evaluate_ready(&state, &probe);
         let ready = report.status == "ready";
         debug!(status = report.status, "health poll");
         match readiness_transition(prev_ready, ready) {
@@ -514,6 +517,23 @@ fn slot_age(head_slot: u64, genesis: u64, seconds_per_slot: u64, now: u64) -> u6
     now.saturating_sub(expected)
 }
 
+/// Send a prepared probe request with the health-poll timeout and return the
+/// body of a successful response. Shared by the EL JSON-RPC and CL REST probes.
+async fn fetch_bytes(state: &AppState, req: Request<ResBody>) -> Result<Bytes, String> {
+    let resp = tokio::time::timeout(state.cfg.health_timeout, state.client.request(req))
+        .await
+        .map_err(|_| "timeout".to_string())?
+        .map_err(|e| format!("transport: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("http {}", resp.status()));
+    }
+    resp.into_body()
+        .collect()
+        .await
+        .map(|c| c.to_bytes())
+        .map_err(|e| format!("read: {e}"))
+}
+
 async fn el_rpc(state: &AppState, payload: Bytes) -> Result<Value, String> {
     let req = Request::builder()
         .method(Method::POST)
@@ -521,22 +541,7 @@ async fn el_rpc(state: &AppState, payload: Bytes) -> Result<Value, String> {
         .header("content-type", "application/json")
         .body(box_full(Full::new(payload)))
         .map_err(|e| format!("build: {e}"))?;
-
-    let resp = tokio::time::timeout(state.cfg.health_timeout, state.client.request(req))
-        .await
-        .map_err(|_| "timeout".to_string())?
-        .map_err(|e| format!("transport: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("http {}", resp.status()));
-    }
-
-    let body = resp
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| format!("read: {e}"))?
-        .to_bytes();
+    let body = fetch_bytes(state, req).await?;
     let v: Value = serde_json::from_slice(&body).map_err(|e| format!("decode: {e}"))?;
     if let Some(err) = v.get("error") {
         return Err(format!("rpc error: {err}"));
@@ -575,22 +580,7 @@ async fn cl_get_json(state: &AppState, uri: &Uri) -> Result<Value, String> {
         .uri(uri.clone())
         .body(box_full(Full::new(Bytes::new())))
         .map_err(|e| format!("build: {e}"))?;
-
-    let resp = tokio::time::timeout(state.cfg.health_timeout, state.client.request(req))
-        .await
-        .map_err(|_| "timeout".to_string())?
-        .map_err(|e| format!("transport: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("http {}", resp.status()));
-    }
-
-    let body = resp
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| format!("read: {e}"))?
-        .to_bytes();
+    let body = fetch_bytes(state, req).await?;
     serde_json::from_slice(&body).map_err(|e| format!("decode: {e}"))
 }
 
