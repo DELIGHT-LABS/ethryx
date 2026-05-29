@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     EL/CL value as a machine-readable numeric field (peer counts, block / slot
     age, sync status) under `el` / `cl`, with any upstream failure recorded in a
     per-layer `errors` array — leaving thresholding and alerting to the consumer.
+  - Both endpoints serve a snapshot refreshed by a background poller that waits
+    `--health-poll-interval` / `ETHRYX_HEALTH_POLL_INTERVAL` (default 5s) between
+    polls, so upstream load is constant regardless of probe rate and a probe
+    never blocks on upstream. Block / slot ages are recomputed live per request.
+    Readiness transitions are logged once by the poller (bounded to the poll
+    rate, and visible even if nothing probes `/readyz`), not per probe.
 
 ### Removed
 

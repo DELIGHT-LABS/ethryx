@@ -81,6 +81,22 @@ CL slot age is derived from `head_slot * --cl-seconds-per-slot +
 --cl-genesis-time`. Use `--network <name>` for a preset (defaults to mainnet)
 instead of typing both; `--cl-genesis-time 0` omits `cl.slot_age_secs`.
 
+### Polling
+
+`/readyz` and `/healthz` don't query upstream per request. A background task
+polls all signals, then waits `--health-poll-interval` (default 5s; each call
+bounded by `--health-timeout`) before the next poll, and the endpoints return
+the latest snapshot instantly — so upstream load is constant regardless of probe
+rate, a slow upstream never blocks a probe, and the poller pauses a full interval
+between polls rather than hammering a struggling node. Block / slot ages are
+recomputed live per request, so they stay accurate between polls. The cache is
+warmed by one poll before the listener accepts, so the process serves a real
+snapshot from its first probe.
+
+Readiness is logged by the poller on transition (becoming not-ready / recovering)
+— once per change, bounded to the poll rate and emitted even if nothing probes
+`/readyz`, rather than warning on every probe.
+
 | `--network` | genesis_time   | seconds_per_slot |
 |-------------|----------------|------------------|
 | `mainnet`   | `1606824023`   | `12`             |

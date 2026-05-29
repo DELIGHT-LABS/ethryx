@@ -1,9 +1,13 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
 use serde::Serialize;
 use serde_json::Value;
-use tracing::warn;
+use tokio::sync::watch;
+use tracing::{info, warn};
 
 use crate::proxy::{ResBody, box_full};
 use crate::state::AppState;
@@ -76,10 +80,38 @@ pub struct ReadyReport {
     pub cl_slot_fresh: Option<Check>,
 }
 
+#[derive(Clone)]
 struct ClStatus {
     head_slot: u64,
     sync_distance: u64,
     is_syncing: bool,
+}
+
+/// The five upstream probe results captured by one poll, shared with the request
+/// handlers via a `watch` channel. `/healthz` and `/readyz` read the latest one
+/// instead of querying upstream per request, so upstream load is decoupled from
+/// probe rate. Stored as raw results so block / slot ages can be recomputed live.
+#[derive(Clone)]
+pub(crate) struct Probe {
+    el_syncing: Result<Value, String>,
+    el_peers: Result<Value, String>,
+    el_block: Result<Value, String>,
+    cl_status: Result<ClStatus, String>,
+    cl_peers: Result<u64, String>,
+}
+
+impl Probe {
+    /// Placeholder used before the first poll lands. The cache is warmed with a
+    /// real poll before any listener accepts, so this is never actually served.
+    pub(crate) fn pending() -> Self {
+        Probe {
+            el_syncing: Err("warming up".into()),
+            el_peers: Err("warming up".into()),
+            el_block: Err("warming up".into()),
+            cl_status: Err("warming up".into()),
+            cl_peers: Err("warming up".into()),
+        }
+    }
 }
 
 const SYNCING_REQ: &[u8] = br#"{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}"#;
@@ -87,23 +119,17 @@ const PEERS_REQ: &[u8] = br#"{"jsonrpc":"2.0","method":"net_peerCount","params":
 const BLOCK_REQ: &[u8] =
     br#"{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["latest",false],"id":1}"#;
 
-/// `/healthz` — verdict-free EL + CL snapshot, **always 200**. Intended for
-/// dashboards / alerting and human inspection; the consumer applies its own
-/// thresholds. Use [`ready`] (`/readyz`) as the load-balancer traffic gate.
-pub async fn report(state: &AppState) -> Response<ResBody> {
-    let (sync_r, peers_r, block_r, cl_status_r, cl_peers_r) = tokio::join!(
-        el_rpc(state, Bytes::from_static(SYNCING_REQ)),
-        el_rpc(state, Bytes::from_static(PEERS_REQ)),
-        el_rpc(state, Bytes::from_static(BLOCK_REQ)),
-        cl_syncing_status(state),
-        cl_peer_count(state),
-    );
+/// `/healthz` — verdict-free EL + CL snapshot, **always 200**. Serves the latest
+/// background poll (see [`poll_loop`]); block / slot ages are recomputed live per
+/// request. Intended for dashboards / alerting; use [`ready`] as the LB gate.
+pub fn report(state: &AppState) -> Response<ResBody> {
+    let probe = state.probe.borrow().clone();
     let snapshot = build_snapshot(
-        &sync_r,
-        &peers_r,
-        &block_r,
-        &cl_status_r,
-        &cl_peers_r,
+        &probe.el_syncing,
+        &probe.el_peers,
+        &probe.el_block,
+        &probe.cl_status,
+        &probe.cl_peers,
         state.cl_genesis_time,
         state.cl_seconds_per_slot,
         now_unix(),
@@ -123,75 +149,147 @@ pub async fn report(state: &AppState) -> Response<ResBody> {
 /// With `--readyz-strict`, EL block age and CL slot age must also be within
 /// their thresholds — choose this when serving strictly-at-head data matters
 /// more than fleet availability during a network-wide stall.
-pub async fn ready(state: &AppState) -> Response<ResBody> {
-    // Always need EL + CL sync. Strict mode additionally needs the latest EL
-    // block for freshness; CL slot age is derived from head_slot, which already
-    // comes back on the syncing response, so it needs no extra request.
-    let strict = state.cfg.readyz_strict;
-    let (sync_r, cl_status_r, block_r) = tokio::join!(
-        el_rpc(state, Bytes::from_static(SYNCING_REQ)),
-        cl_syncing_status(state),
-        async {
-            if strict {
-                Some(el_rpc(state, Bytes::from_static(BLOCK_REQ)).await)
-            } else {
-                None
-            }
-        },
-    );
-
-    let el_syncing = check_el_syncing(&sync_r);
-    let cl_syncing = check_cl_syncing(&cl_status_r);
-    let (el_block_fresh, cl_slot_fresh) = match block_r {
-        Some(block_r) => {
-            let now = now_unix();
-            (
-                Some(check_el_block_fresh(
-                    &block_r,
-                    state.cfg.el_max_block_age_secs,
-                    now,
-                )),
-                Some(check_cl_slot_fresh(
-                    &cl_status_r,
-                    state.cl_genesis_time,
-                    state.cl_seconds_per_slot,
-                    state.cfg.cl_max_slot_age_secs,
-                    now,
-                )),
-            )
-        }
-        None => (None, None),
-    };
-
-    let all_ok = el_syncing.ok
-        && cl_syncing.ok
-        && el_block_fresh.as_ref().is_none_or(|c| c.ok)
-        && cl_slot_fresh.as_ref().is_none_or(|c| c.ok);
-    if !all_ok {
-        let el_block = el_block_fresh.as_ref().map_or("-", |c| c.detail.as_str());
-        let cl_slot = cl_slot_fresh.as_ref().map_or("-", |c| c.detail.as_str());
-        warn!(
-            el_syncing = %el_syncing.detail,
-            cl_syncing = %cl_syncing.detail,
-            el_block,
-            cl_slot,
-            "not ready"
-        );
-    }
-
-    let report = ReadyReport {
-        status: if all_ok { "ready" } else { "not_ready" },
-        el_syncing,
-        cl_syncing,
-        el_block_fresh,
-        cl_slot_fresh,
-    };
-    let code = if all_ok {
+pub fn ready(state: &AppState) -> Response<ResBody> {
+    let probe = state.probe.borrow().clone();
+    let report = evaluate_ready(state, &probe, now_unix());
+    let code = if report.status == "ready" {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
     json_response(code, &report)
+}
+
+/// Build the `/readyz` verdict from a probe snapshot. Default gates on EL + CL
+/// sync only; `--readyz-strict` also gates on block / slot freshness. Shared by
+/// the endpoint and the poller's transition logging.
+fn evaluate_ready(state: &AppState, probe: &Probe, now: u64) -> ReadyReport {
+    let el_syncing = check_el_syncing(&probe.el_syncing);
+    let cl_syncing = check_cl_syncing(&probe.cl_status);
+    let (el_block_fresh, cl_slot_fresh) = if state.cfg.readyz_strict {
+        (
+            Some(check_el_block_fresh(
+                &probe.el_block,
+                state.cfg.el_max_block_age_secs,
+                now,
+            )),
+            Some(check_cl_slot_fresh(
+                &probe.cl_status,
+                state.cl_genesis_time,
+                state.cl_seconds_per_slot,
+                state.cfg.cl_max_slot_age_secs,
+                now,
+            )),
+        )
+    } else {
+        (None, None)
+    };
+    let all_ok = el_syncing.ok
+        && cl_syncing.ok
+        && el_block_fresh.as_ref().is_none_or(|c| c.ok)
+        && cl_slot_fresh.as_ref().is_none_or(|c| c.ok);
+    ReadyReport {
+        status: if all_ok { "ready" } else { "not_ready" },
+        el_syncing,
+        cl_syncing,
+        el_block_fresh,
+        cl_slot_fresh,
+    }
+}
+
+/// What [`poll_loop`] should log given the previous and current readiness, so a
+/// sustained state logs once (on transition) rather than once per poll.
+enum Transition {
+    Silent,
+    BecameNotReady,
+    Recovered,
+}
+
+fn readiness_transition(prev_ready: Option<bool>, ready: bool) -> Transition {
+    match prev_ready {
+        Some(p) if p == ready => Transition::Silent,
+        None if ready => Transition::Silent, // first poll already healthy: stay quiet
+        _ if ready => Transition::Recovered,
+        _ => Transition::BecameNotReady, // first-poll-degraded or ready -> not-ready
+    }
+}
+
+/// Query all five upstream signals once. Each call is bounded by
+/// `--health-timeout`; failures land in the result rather than aborting.
+pub(crate) async fn probe_once(state: &AppState) -> Probe {
+    let (el_syncing, el_peers, el_block, cl_status, cl_peers) = tokio::join!(
+        el_rpc(state, Bytes::from_static(SYNCING_REQ)),
+        el_rpc(state, Bytes::from_static(PEERS_REQ)),
+        el_rpc(state, Bytes::from_static(BLOCK_REQ)),
+        cl_syncing_status(state),
+        cl_peer_count(state),
+    );
+    Probe {
+        el_syncing,
+        el_peers,
+        el_block,
+        cl_status,
+        cl_peers,
+    }
+}
+
+/// Refresh the shared [`Probe`] until shutdown: poll, then sleep `interval`,
+/// repeat. The cache is warmed by one poll before this loop starts, so the first
+/// background refresh lands `interval` later. Sleeping *after* each poll gives a
+/// slow upstream a full `interval` breather instead of being polled back-to-back.
+/// An in-flight poll is cancelled promptly on shutdown.
+///
+/// This loop is also the single place readiness is logged: a transition is logged
+/// once (bounded to the poll rate), independent of how often `/readyz` is probed,
+/// and visible even if nothing probes it.
+pub(crate) async fn poll_loop(
+    state: Arc<AppState>,
+    tx: watch::Sender<Arc<Probe>>,
+    mut shutdown: watch::Receiver<bool>,
+    interval: Duration,
+) {
+    let mut prev_ready: Option<bool> = None;
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => return,
+            _ = tokio::time::sleep(interval) => {}
+        }
+        let probe = tokio::select! {
+            biased;
+            _ = shutdown.changed() => return,
+            probe = probe_once(&state) => probe,
+        };
+
+        let report = evaluate_ready(&state, &probe, now_unix());
+        let ready = report.status == "ready";
+        match readiness_transition(prev_ready, ready) {
+            Transition::Silent => {}
+            Transition::Recovered => info!("readiness recovered"),
+            Transition::BecameNotReady => {
+                let el_block = report
+                    .el_block_fresh
+                    .as_ref()
+                    .map_or("-", |c| c.detail.as_str());
+                let cl_slot = report
+                    .cl_slot_fresh
+                    .as_ref()
+                    .map_or("-", |c| c.detail.as_str());
+                warn!(
+                    el_syncing = %report.el_syncing.detail,
+                    cl_syncing = %report.cl_syncing.detail,
+                    el_block,
+                    cl_slot,
+                    "not ready"
+                );
+            }
+        }
+        prev_ready = Some(ready);
+
+        if tx.send(Arc::new(probe)).is_err() {
+            return; // all receivers dropped
+        }
+    }
 }
 
 fn json_response<T: Serialize>(code: StatusCode, body: &T) -> Response<ResBody> {
@@ -673,6 +771,23 @@ mod tests {
     fn slot_age_saturates_on_garbage_head_slot() {
         // A bogus head_slot from upstream must not overflow-panic or wrap.
         assert_eq!(slot_age(u64::MAX, 1_606_824_023, 12, 2_000_000_000), 0);
+    }
+
+    #[test]
+    fn readiness_transitions_log_only_on_change() {
+        use Transition::*;
+        // First poll: degraded warns, already-healthy stays quiet.
+        assert!(matches!(readiness_transition(None, false), BecameNotReady));
+        assert!(matches!(readiness_transition(None, true), Silent));
+        // Steady state: no repeat logs.
+        assert!(matches!(readiness_transition(Some(true), true), Silent));
+        assert!(matches!(readiness_transition(Some(false), false), Silent));
+        // Edges: log once each way.
+        assert!(matches!(
+            readiness_transition(Some(true), false),
+            BecameNotReady
+        ));
+        assert!(matches!(readiness_transition(Some(false), true), Recovered));
     }
 
     // ---- /healthz numeric snapshot ----

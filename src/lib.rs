@@ -36,6 +36,9 @@ where
     if cfg.listen.is_empty() {
         return Err("no listen addresses configured".into());
     }
+    if cfg.health_poll_interval.is_zero() {
+        return Err("health-poll-interval must be at least 1 second".into());
+    }
 
     info!(?cfg, "starting ethryx");
 
@@ -46,8 +49,13 @@ where
     let cl_peer_count_uri = format!("{cl_base}/eth/v1/node/peer_count").parse()?;
     let cl_genesis_time = cfg.resolve_cl_genesis_time()?;
     let cl_seconds_per_slot = cfg.resolve_cl_seconds_per_slot()?;
+    let poll_interval = cfg.health_poll_interval;
     let shutdown_grace = cfg.shutdown_grace;
     let listen_addrs = cfg.listen.clone();
+
+    let (probe_tx, probe_rx) = watch::channel(Arc::new(health::Probe::pending()));
+    let (shutdown_tx, _) = watch::channel(false);
+
     let state = Arc::new(AppState {
         cfg,
         client,
@@ -56,7 +64,19 @@ where
         cl_peer_count_uri,
         cl_genesis_time,
         cl_seconds_per_slot,
+        probe: probe_rx,
     });
+
+    // Warm the health cache with one poll before serving, then refresh it in the
+    // background so /healthz and /readyz read a snapshot instead of hitting
+    // upstream on every probe.
+    let _ = probe_tx.send(Arc::new(health::probe_once(&state).await));
+    let poller = tokio::spawn(health::poll_loop(
+        state.clone(),
+        probe_tx,
+        shutdown_tx.subscribe(),
+        poll_interval,
+    ));
 
     let mut listeners = Vec::with_capacity(listen_addrs.len());
     for addr in &listen_addrs {
@@ -65,7 +85,6 @@ where
         listeners.push(listener);
     }
 
-    let (shutdown_tx, _) = watch::channel(false);
     let mut accept_handles = Vec::with_capacity(listeners.len());
     for listener in listeners {
         let state = state.clone();
@@ -81,6 +100,7 @@ where
     for h in accept_handles {
         let _ = h.await;
     }
+    let _ = poller.await;
 
     info!(
         grace_secs = shutdown_grace.as_secs(),
