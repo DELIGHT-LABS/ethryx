@@ -27,6 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     never blocks on upstream. Block / slot ages are recomputed live per request.
     Readiness transitions are logged once by the poller (bounded to the poll
     rate, and visible even if nothing probes `/readyz`), not per probe.
+- `--log-level` / `ETHRYX_LOG_LEVEL` (default `info`) to set the log level when
+  `RUST_LOG` is unset; `RUST_LOG` still overrides it and allows per-target
+  directives.
+
+### Changed
+
+- Logging follows a sidecar discipline: routine upstream / client failures
+  (proxy 502s, WebSocket drops) and each health poll are now `debug` (were
+  `error`); readiness changes are logged once at `warn` (not-ready) / `info`
+  (recovered); listener `accept()` failures stay `warn`; request routing is
+  `trace`.
 
 ### Removed
 

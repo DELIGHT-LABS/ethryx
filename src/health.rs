@@ -7,7 +7,7 @@ use http_body_util::{BodyExt, Full};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::proxy::{ResBody, box_full};
 use crate::state::AppState;
@@ -263,6 +263,7 @@ pub(crate) async fn poll_loop(
 
         let report = evaluate_ready(&state, &probe, now_unix());
         let ready = report.status == "ready";
+        debug!(status = report.status, "health poll");
         match readiness_transition(prev_ready, ready) {
             Transition::Silent => {}
             Transition::Recovered => info!("readiness recovered"),

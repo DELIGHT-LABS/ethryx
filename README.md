@@ -139,6 +139,31 @@ ETHRYX_LISTEN=0.0.0.0:8547,127.0.0.1:9547 ethryx ...
 Each listener runs an independent accept loop on the tokio runtime, so cores
 saturate naturally without cross-listener locks.
 
+## Logging
+
+Structured JSON to stdout. Levels follow a sidecar-appropriate discipline:
+
+| Level   | What                                                                |
+|---------|---------------------------------------------------------------------|
+| `error` | genuine internal faults                                             |
+| `warn`  | readiness became **not-ready** (LB will deroute); `accept()` failed |
+| `info`  | lifecycle (start / listen / shutdown) and readiness **recovered**  |
+| `debug` | routine activity: per-request proxy / WS outcomes, each health poll |
+| `trace` | fine-grained internal flow (request routing)                        |
+
+Routine upstream / client failures (a 502, a dropped WebSocket) are `debug`, not
+`error` — for a sidecar they are everyday. Readiness *changes* are logged once by
+the poller (not per probe), so the default `info` output stays quiet until
+something actually changes.
+
+Set the level with `--log-level <trace|debug|info|warn|error>` (default `info`).
+`RUST_LOG` overrides it and allows per-target directives:
+
+```sh
+ethryx --log-level debug ...
+RUST_LOG=ethryx=debug,hyper=warn ethryx ...
+```
+
 ## systemd
 
 ```ini

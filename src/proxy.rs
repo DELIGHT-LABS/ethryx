@@ -10,7 +10,7 @@ use hyper::body::Incoming;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
 use tokio_tungstenite::connect_async;
-use tracing::{debug, error};
+use tracing::{debug, trace};
 
 use crate::headers::strip_hop_by_hop;
 use crate::health;
@@ -41,12 +41,15 @@ pub async fn dispatch(
     state: Arc<AppState>,
 ) -> Result<Response<ResBody>, Infallible> {
     Ok(route(req, &state).await.unwrap_or_else(|e| {
-        error!(error = %e, "proxy error");
+        // Routine for a sidecar (upstream hiccup, client cancel); the client
+        // still gets a 502. Surface at debug, not error.
+        debug!(error = %e, "proxy error");
         text_response(StatusCode::BAD_GATEWAY, e.to_string())
     }))
 }
 
 async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResBody>, BoxError> {
+    trace!(method = %req.method(), path = req.uri().path(), "routing request");
     if req.method() == Method::GET {
         let path = req.uri().path();
         if path == "/healthz" {
@@ -107,14 +110,14 @@ async fn ws_upgrade(
         match tokio::time::timeout(connect_timeout, connect_async(&upstream_url)).await {
             Ok(Ok((ws, _))) => ws,
             Ok(Err(e)) => {
-                error!(error = %e, upstream = %upstream_url, "upstream ws connect failed");
+                debug!(error = %e, upstream = %upstream_url, "upstream ws connect failed");
                 return Ok(text_response(
                     StatusCode::BAD_GATEWAY,
                     format!("upstream ws connect failed: {e}"),
                 ));
             }
             Err(_) => {
-                error!(upstream = %upstream_url, "upstream ws connect timed out");
+                debug!(upstream = %upstream_url, "upstream ws connect timed out");
                 return Ok(text_response(
                     StatusCode::BAD_GATEWAY,
                     "upstream ws connect timed out",
@@ -127,7 +130,7 @@ async fn ws_upgrade(
         let client_ws = match websocket.await {
             Ok(ws) => ws,
             Err(e) => {
-                error!(error = %e, "client ws upgrade failed");
+                debug!(error = %e, "client ws upgrade failed");
                 return;
             }
         };

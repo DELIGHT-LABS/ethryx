@@ -114,6 +114,16 @@ pub struct Config {
     #[arg(long, env = "ETHRYX_HEALTH_POLL_INTERVAL", default_value = "5", value_parser = parse_secs)]
     pub health_poll_interval: Duration,
 
+    /// Log level used when `RUST_LOG` is unset. `RUST_LOG` overrides this and
+    /// additionally allows per-target directives (e.g. `ethryx=debug,hyper=warn`).
+    #[arg(
+        long,
+        env = "ETHRYX_LOG_LEVEL",
+        default_value = "info",
+        value_parser = ["trace", "debug", "info", "warn", "error"]
+    )]
+    pub log_level: String,
+
     /// Upstream timeout for proxied requests (seconds).
     #[arg(long, env = "ETHRYX_PROXY_TIMEOUT", default_value = "60", value_parser = parse_secs)]
     pub proxy_timeout: Duration,
@@ -258,6 +268,16 @@ mod tests {
     #[test]
     fn health_poll_interval_defaults_to_5s() {
         assert_eq!(parse(&[]).health_poll_interval, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn log_level_defaults_to_info() {
+        assert_eq!(parse(&[]).log_level, "info");
+    }
+
+    #[test]
+    fn log_level_rejects_unknown_value() {
+        assert!(Config::try_parse_from(["ethryx", "--log-level", "bogus"]).is_err());
     }
 
     #[test]
