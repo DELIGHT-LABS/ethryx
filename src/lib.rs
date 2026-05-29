@@ -21,7 +21,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tracing::{debug, error, info};
+use tracing::{debug, info, warn};
 
 use crate::state::AppState;
 
@@ -124,7 +124,7 @@ async fn accept_loop(
                 let (stream, peer) = match accept {
                     Ok(x) => x,
                     Err(e) => {
-                        error!(error = %e, "accept failed");
+                        warn!(error = %e, "accept failed");
                         continue;
                     }
                 };
