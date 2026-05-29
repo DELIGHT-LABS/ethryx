@@ -50,10 +50,10 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
     if req.method() == Method::GET {
         let path = req.uri().path();
         if path == "/healthz" {
-            return Ok(health::report(state).await);
+            return Ok(health::report(state));
         }
         if path == "/readyz" {
-            return Ok(health::ready(state).await);
+            return Ok(health::ready(state));
         }
         if path == "/livez" {
             return Ok(text_response(StatusCode::OK, Bytes::from_static(b"ok")));

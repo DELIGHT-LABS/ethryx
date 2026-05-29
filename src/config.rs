@@ -104,9 +104,15 @@ pub struct Config {
     #[arg(long, env = "ETHRYX_CL_SECONDS_PER_SLOT")]
     pub cl_seconds_per_slot: Option<u64>,
 
-    /// Upstream timeout for `/healthz` and `/readyz` probe RPCs (seconds).
+    /// Upstream timeout for each background health-poll RPC (seconds).
     #[arg(long, env = "ETHRYX_HEALTH_TIMEOUT", default_value = "3", value_parser = parse_secs)]
     pub health_timeout: Duration,
+
+    /// Interval between background health polls (seconds). `/healthz` and
+    /// `/readyz` serve the latest poll, so upstream load stays constant
+    /// regardless of probe rate. Must be at least 1 second.
+    #[arg(long, env = "ETHRYX_HEALTH_POLL_INTERVAL", default_value = "5", value_parser = parse_secs)]
+    pub health_poll_interval: Duration,
 
     /// Upstream timeout for proxied requests (seconds).
     #[arg(long, env = "ETHRYX_PROXY_TIMEOUT", default_value = "60", value_parser = parse_secs)]
@@ -247,6 +253,11 @@ mod tests {
     fn readyz_strict_accepts_explicit_bool() {
         assert!(parse(&["--readyz-strict", "true"]).readyz_strict);
         assert!(!parse(&["--readyz-strict", "false"]).readyz_strict);
+    }
+
+    #[test]
+    fn health_poll_interval_defaults_to_5s() {
+        assert_eq!(parse(&[]).health_poll_interval, Duration::from_secs(5));
     }
 
     #[test]

@@ -263,18 +263,33 @@ async fn jsonrpc_post_is_forwarded_to_el_http_upstream() {
     let v: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["result"], "0xdeadbeef");
 
-    let got = el.received();
-    assert_eq!(got.len(), 1);
-    let req: Value = serde_json::from_slice(&got[0].body).unwrap();
-    assert_eq!(req["method"], "eth_blockNumber");
+    // EL also receives background health-poll RPCs; filter for the forwarded one.
+    let methods: Vec<String> = el
+        .received()
+        .iter()
+        .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+        .filter_map(|v| v.get("method").and_then(Value::as_str).map(String::from))
+        .collect();
+    assert_eq!(
+        methods.iter().filter(|m| *m == "eth_blockNumber").count(),
+        1,
+        "expected one forwarded eth_blockNumber, saw {methods:?}"
+    );
 
     ethryx.shutdown().await;
 }
 
 #[tokio::test]
 async fn beacon_path_is_routed_to_cl_upstream() {
-    let el = MockServer::start(Arc::new(|_| {
-        panic!("EL must not see /eth/ traffic");
+    let el = MockServer::start(Arc::new(|req| {
+        // Background health polls legitimately POST to "/"; only /eth/ beacon
+        // paths must never be routed to the EL upstream.
+        assert!(
+            !req.path.starts_with("/eth/"),
+            "EL must not see beacon /eth/ traffic, got {}",
+            req.path
+        );
+        (StatusCode::OK, b"{}".to_vec())
     }))
     .await;
     let cl = MockServer::start(Arc::new(|req| {
@@ -359,6 +374,110 @@ async fn healthz_is_200_even_when_upstreams_fail() {
     );
 
     ethryx.shutdown().await;
+}
+
+#[tokio::test]
+async fn healthz_is_served_from_cache_not_per_request() {
+    // With a long poll interval, only the startup poll hits upstream. Repeated
+    // /healthz requests must read the cached snapshot and add no upstream calls.
+    let el = MockServer::start(ok_handler()).await;
+    let cl = MockServer::start(ok_handler()).await;
+    let ethryx = EthryxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl.url,
+        "--health-poll-interval",
+        "60",
+    ])
+    .await;
+
+    let c = client();
+    for _ in 0..5 {
+        let (status, _) = get(&c, &ethryx.url("/healthz")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    // One startup poll = 3 EL calls (eth_syncing, net_peerCount,
+    // eth_getBlockByNumber) + 2 CL calls, regardless of how many probes arrive.
+    assert_eq!(el.received().len(), 3, "EL calls: {:?}", el.received());
+    assert_eq!(cl.received().len(), 2, "CL calls: {:?}", cl.received());
+
+    ethryx.shutdown().await;
+}
+
+#[tokio::test]
+async fn healthz_cache_refreshes_in_background() {
+    // The poller must keep refreshing. net_peerCount returns 16 on the first
+    // (warm-seed) call and 32 after; with a 1s interval, a read taken past one
+    // interval must reflect the background poll, not the seed.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let pc = Arc::new(AtomicU64::new(0));
+    let el = MockServer::start(Arc::new(move |req| {
+        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+        let result = match body.get("method").and_then(Value::as_str).unwrap_or("") {
+            "eth_syncing" => json!(false),
+            "net_peerCount" => {
+                if pc.fetch_add(1, Ordering::SeqCst) == 0 {
+                    json!("0x10") // 16, warm seed
+                } else {
+                    json!("0x20") // 32, later background polls
+                }
+            }
+            "eth_getBlockByNumber" => json!({"number": "0x1", "timestamp": "0x1"}),
+            _ => json!(null),
+        };
+        let resp = json!({"jsonrpc": "2.0", "id": 1, "result": result});
+        (StatusCode::OK, serde_json::to_vec(&resp).unwrap())
+    }))
+    .await;
+    let cl = MockServer::start(ok_handler()).await;
+    let ethryx = EthryxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl.url,
+        "--health-poll-interval",
+        "1",
+    ])
+    .await;
+
+    let c = client();
+    let (_, b1) = get(&c, &ethryx.url("/healthz")).await;
+    let v1: Value = serde_json::from_slice(&b1).unwrap();
+    assert_eq!(
+        v1["el"]["peers"], 16,
+        "first read is the warm-seed poll: {v1}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let (_, b2) = get(&c, &ethryx.url("/healthz")).await;
+    let v2: Value = serde_json::from_slice(&b2).unwrap();
+    assert_eq!(
+        v2["el"]["peers"], 32,
+        "background poll should have refreshed the cache: {v2}"
+    );
+
+    ethryx.shutdown().await;
+}
+
+#[tokio::test]
+async fn run_rejects_zero_poll_interval() {
+    let cfg = Config::try_parse_from([
+        "ethryx",
+        "--listen",
+        "127.0.0.1:0",
+        "--health-poll-interval",
+        "0",
+    ])
+    .expect("clap parse");
+    let err = run(cfg, async {})
+        .await
+        .expect_err("zero poll interval must be rejected");
+    assert!(
+        err.to_string().contains("health-poll-interval"),
+        "got: {err}"
+    );
 }
 
 #[tokio::test]
