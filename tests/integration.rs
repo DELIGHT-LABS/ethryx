@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use clap::Parser;
+use futures_util::{SinkExt, StreamExt};
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -19,6 +20,8 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use tokio_tungstenite::{accept_async, connect_async};
 
 use ethryx::{Config, run};
 
@@ -626,4 +629,87 @@ async fn multi_port_listen_serves_same_routes() {
 
     let _ = tx.send(());
     let _ = task.await;
+}
+
+// ---------- websocket ----------
+
+/// Minimal WebSocket echo upstream. Returns its `ws://addr` URL; echoes every
+/// text/binary frame straight back.
+async fn ws_echo_upstream() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(ws) = accept_async(stream).await else {
+                    return;
+                };
+                let (mut tx, mut rx) = ws.split();
+                while let Some(Ok(msg)) = rx.next().await {
+                    if (msg.is_text() || msg.is_binary()) && tx.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    format!("ws://{addr}")
+}
+
+#[tokio::test]
+async fn ws_handshake_fails_with_502_when_upstream_down() {
+    // Nothing listens on the WS upstream. ethryx dials upstream *before*
+    // completing the client handshake, so the client gets a 502 on the handshake
+    // rather than a 101 followed by an immediate abnormal close.
+    let el = MockServer::start(ok_handler()).await;
+    let cl = MockServer::start(ok_handler()).await;
+    let dead = pick_port().await; // bound then released -> nothing listening
+    let ethryx = EthryxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl.url,
+        "--el-ws-url",
+        &format!("ws://127.0.0.1:{dead}"),
+    ])
+    .await;
+
+    let url = format!("ws://127.0.0.1:{}/", ethryx.port);
+    match connect_async(&url).await {
+        Err(WsError::Http(resp)) => assert_eq!(resp.status(), StatusCode::BAD_GATEWAY),
+        other => panic!("expected a 502 handshake error, got {other:?}"),
+    }
+
+    ethryx.shutdown().await;
+}
+
+#[tokio::test]
+async fn ws_bridge_echoes_through_upstream() {
+    // With the upstream up, the reordered handshake still establishes and the
+    // bidirectional bridge forwards frames.
+    let el = MockServer::start(ok_handler()).await;
+    let cl = MockServer::start(ok_handler()).await;
+    let ws_upstream = ws_echo_upstream().await;
+    let ethryx = EthryxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl.url,
+        "--el-ws-url",
+        &ws_upstream,
+    ])
+    .await;
+
+    let url = format!("ws://127.0.0.1:{}/", ethryx.port);
+    let (mut ws, _resp) = connect_async(&url).await.expect("handshake should succeed");
+    ws.send(Message::Text("ping".into())).await.unwrap();
+    let echoed = loop {
+        match ws.next().await.expect("a reply").expect("ok frame") {
+            Message::Text(t) => break t,
+            _ => continue,
+        }
+    };
+    assert_eq!(echoed.as_str(), "ping");
+
+    ethryx.shutdown().await;
 }

@@ -63,7 +63,7 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
         return http_proxy(req, state, &state.cfg.cl_beacon_url).await;
     }
     if hyper_tungstenite::is_upgrade_request(&req) {
-        return ws_upgrade(req, state.cfg.el_ws_url.clone()).await;
+        return ws_upgrade(req, state.cfg.el_ws_url.clone(), state.cfg.proxy_timeout).await;
     }
     http_proxy(req, state, &state.cfg.el_http_url).await
 }
@@ -95,20 +95,39 @@ async fn http_proxy(
 async fn ws_upgrade(
     mut req: Request<Incoming>,
     upstream_url: String,
+    connect_timeout: Duration,
 ) -> Result<Response<ResBody>, BoxError> {
+    // Dial the upstream WebSocket *before* completing the client upgrade. If we
+    // returned 101 first and the upstream were down, the client would see a
+    // successful handshake immediately followed by an abnormal close with no
+    // reason. Connecting first lets a dead or slow upstream surface as a 502 on
+    // the handshake instead — and bounds the dial so a hung upstream can't leak
+    // a half-open client connection.
+    let upstream_ws =
+        match tokio::time::timeout(connect_timeout, connect_async(&upstream_url)).await {
+            Ok(Ok((ws, _))) => ws,
+            Ok(Err(e)) => {
+                error!(error = %e, upstream = %upstream_url, "upstream ws connect failed");
+                return Ok(text_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!("upstream ws connect failed: {e}"),
+                ));
+            }
+            Err(_) => {
+                error!(upstream = %upstream_url, "upstream ws connect timed out");
+                return Ok(text_response(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream ws connect timed out",
+                ));
+            }
+        };
+
     let (response, websocket) = hyper_tungstenite::upgrade(&mut req, None)?;
     tokio::spawn(async move {
         let client_ws = match websocket.await {
             Ok(ws) => ws,
             Err(e) => {
                 error!(error = %e, "client ws upgrade failed");
-                return;
-            }
-        };
-        let (upstream_ws, _) = match connect_async(&upstream_url).await {
-            Ok(x) => x,
-            Err(e) => {
-                error!(error = %e, upstream = %upstream_url, "upstream ws connect failed");
                 return;
             }
         };
