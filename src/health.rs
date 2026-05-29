@@ -8,21 +8,72 @@ use tracing::warn;
 use crate::proxy::{ResBody, box_full};
 use crate::state::AppState;
 
+/// One readiness signal: a pass/fail verdict plus a human-readable detail.
+/// Used only by `/readyz`, which must render a verdict to gate traffic.
 #[derive(Serialize)]
 pub struct Check {
     pub ok: bool,
     pub detail: String,
 }
 
+/// `/healthz` view: a verdict-free, machine-readable snapshot of current EL + CL
+/// state. Numeric fields carry the live values (peer counts, block / slot age,
+/// sync status) for the consumer to threshold; any upstream failure is recorded
+/// in the layer's `errors`, and unavailable fields are omitted. This endpoint
+/// **always returns 200** — it reports state, it does not judge it. Thresholding
+/// / alerting belongs in the consumer (Prometheus, dashboards), and traffic
+/// gating belongs in `/readyz`.
 #[derive(Serialize)]
-pub struct Report {
+pub struct HealthSnapshot {
+    pub el: ElHealth,
+    pub cl: ClHealth,
+}
+
+#[derive(Serialize, Default)]
+pub struct ElHealth {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub syncing: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_distance: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peers: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_age_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+}
+
+#[derive(Serialize, Default)]
+pub struct ClHealth {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub syncing: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_distance: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peers: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot_age_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+}
+
+/// `/readyz` view: the load-balancer readiness verdict. Defaults to sync status
+/// only; the freshness fields are populated (and gated on) only under
+/// `--readyz-strict`. Peer count is intentionally never part of readiness — it
+/// is a soft, fleet-correlated signal that belongs in `/healthz`.
+#[derive(Serialize)]
+pub struct ReadyReport {
     pub status: &'static str,
     pub el_syncing: Check,
-    pub el_peers: Check,
-    pub el_block_fresh: Check,
     pub cl_syncing: Check,
-    pub cl_peers: Check,
-    pub cl_slot_fresh: Check,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub el_block_fresh: Option<Check>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cl_slot_fresh: Option<Check>,
 }
 
 struct ClStatus {
@@ -36,6 +87,9 @@ const PEERS_REQ: &[u8] = br#"{"jsonrpc":"2.0","method":"net_peerCount","params":
 const BLOCK_REQ: &[u8] =
     br#"{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["latest",false],"id":1}"#;
 
+/// `/healthz` — verdict-free EL + CL snapshot, **always 200**. Intended for
+/// dashboards / alerting and human inspection; the consumer applies its own
+/// thresholds. Use [`ready`] (`/readyz`) as the load-balancer traffic gate.
 pub async fn report(state: &AppState) -> Response<ResBody> {
     let (sync_r, peers_r, block_r, cl_status_r, cl_peers_r) = tokio::join!(
         el_rpc(state, Bytes::from_static(SYNCING_REQ)),
@@ -44,8 +98,115 @@ pub async fn report(state: &AppState) -> Response<ResBody> {
         cl_syncing_status(state),
         cl_peer_count(state),
     );
+    let snapshot = build_snapshot(
+        &sync_r,
+        &peers_r,
+        &block_r,
+        &cl_status_r,
+        &cl_peers_r,
+        state.cl_genesis_time,
+        state.cl_seconds_per_slot,
+        now_unix(),
+    );
+    json_response(StatusCode::OK, &snapshot)
+}
 
-    let el_syncing = match sync_r {
+/// `/readyz` — load-balancer readiness gate. 200 when ready, else 503.
+///
+/// By default this gates **only on EL + CL sync status**. A node that is caught
+/// up reports `eth_syncing == false` even when the chain itself stalls
+/// network-wide, so freshness/peer dips that hit the whole fleet at once do not
+/// pull every backend out of rotation (which would turn a chain incident into a
+/// total RPC outage). Sync status is the node-local signal that genuinely
+/// distinguishes "this node can serve" from "this node is behind its peers".
+///
+/// With `--readyz-strict`, EL block age and CL slot age must also be within
+/// their thresholds — choose this when serving strictly-at-head data matters
+/// more than fleet availability during a network-wide stall.
+pub async fn ready(state: &AppState) -> Response<ResBody> {
+    // Always need EL + CL sync. Strict mode additionally needs the latest EL
+    // block for freshness; CL slot age is derived from head_slot, which already
+    // comes back on the syncing response, so it needs no extra request.
+    let strict = state.cfg.readyz_strict;
+    let (sync_r, cl_status_r, block_r) = tokio::join!(
+        el_rpc(state, Bytes::from_static(SYNCING_REQ)),
+        cl_syncing_status(state),
+        async {
+            if strict {
+                Some(el_rpc(state, Bytes::from_static(BLOCK_REQ)).await)
+            } else {
+                None
+            }
+        },
+    );
+
+    let el_syncing = check_el_syncing(&sync_r);
+    let cl_syncing = check_cl_syncing(&cl_status_r);
+    let (el_block_fresh, cl_slot_fresh) = match block_r {
+        Some(block_r) => {
+            let now = now_unix();
+            (
+                Some(check_el_block_fresh(
+                    &block_r,
+                    state.cfg.el_max_block_age_secs,
+                    now,
+                )),
+                Some(check_cl_slot_fresh(
+                    &cl_status_r,
+                    state.cl_genesis_time,
+                    state.cl_seconds_per_slot,
+                    state.cfg.cl_max_slot_age_secs,
+                    now,
+                )),
+            )
+        }
+        None => (None, None),
+    };
+
+    let all_ok = el_syncing.ok
+        && cl_syncing.ok
+        && el_block_fresh.as_ref().is_none_or(|c| c.ok)
+        && cl_slot_fresh.as_ref().is_none_or(|c| c.ok);
+    if !all_ok {
+        let el_block = el_block_fresh.as_ref().map_or("-", |c| c.detail.as_str());
+        let cl_slot = cl_slot_fresh.as_ref().map_or("-", |c| c.detail.as_str());
+        warn!(
+            el_syncing = %el_syncing.detail,
+            cl_syncing = %cl_syncing.detail,
+            el_block,
+            cl_slot,
+            "not ready"
+        );
+    }
+
+    let report = ReadyReport {
+        status: if all_ok { "ready" } else { "not_ready" },
+        el_syncing,
+        cl_syncing,
+        el_block_fresh,
+        cl_slot_fresh,
+    };
+    let code = if all_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    json_response(code, &report)
+}
+
+fn json_response<T: Serialize>(code: StatusCode, body: &T) -> Response<ResBody> {
+    let body_bytes = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
+    Response::builder()
+        .status(code)
+        .header("content-type", "application/json")
+        .body(box_full(Full::new(Bytes::from(body_bytes))))
+        .expect("response builder")
+}
+
+// ---- readiness verdicts (Check): sync is a fact; freshness uses thresholds ----
+
+fn check_el_syncing(r: &Result<Value, String>) -> Check {
+    match r {
         Ok(Value::Bool(false)) => Check {
             ok: true,
             detail: "synced".into(),
@@ -72,72 +233,11 @@ pub async fn report(state: &AppState) -> Response<ResBody> {
             ok: false,
             detail: format!("eth_syncing: {e}"),
         },
-    };
-    let el_peers = match peers_r {
-        Ok(Value::String(hex)) => match hex_to_u64(&hex) {
-            Some(n) if n >= state.cfg.el_min_peers => Check {
-                ok: true,
-                detail: format!("{n} peers"),
-            },
-            Some(n) => Check {
-                ok: false,
-                detail: format!("{n} peers (min {})", state.cfg.el_min_peers),
-            },
-            None => Check {
-                ok: false,
-                detail: format!("invalid hex: {hex}"),
-            },
-        },
-        Ok(v) => Check {
-            ok: false,
-            detail: format!("unexpected: {v}"),
-        },
-        Err(e) => Check {
-            ok: false,
-            detail: format!("net_peerCount: {e}"),
-        },
-    };
-    let el_block_fresh = match block_r {
-        Ok(block) => {
-            let ts = block
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .and_then(hex_to_u64);
-            let num = block
-                .get("number")
-                .and_then(Value::as_str)
-                .and_then(hex_to_u64);
-            match (ts, num) {
-                (Some(t), Some(n)) => {
-                    let age = now_unix().saturating_sub(t);
-                    if age <= state.cfg.el_max_block_age_secs {
-                        Check {
-                            ok: true,
-                            detail: format!("block {n}, age {age}s"),
-                        }
-                    } else {
-                        Check {
-                            ok: false,
-                            detail: format!(
-                                "block {n} stale: {age}s (max {})",
-                                state.cfg.el_max_block_age_secs
-                            ),
-                        }
-                    }
-                }
-                _ => Check {
-                    ok: false,
-                    detail: "block missing fields".into(),
-                },
-            }
-        }
-        Err(e) => Check {
-            ok: false,
-            detail: format!("eth_getBlockByNumber: {e}"),
-        },
-    };
+    }
+}
 
-    let cl_syncing = match &cl_status_r {
+fn check_cl_syncing(r: &Result<ClStatus, String>) -> Check {
+    match r {
         Ok(s) if !s.is_syncing => Check {
             ok: true,
             detail: format!(
@@ -156,30 +256,47 @@ pub async fn report(state: &AppState) -> Response<ResBody> {
             ok: false,
             detail: format!("node/syncing: {e}"),
         },
-    };
-    let cl_peers = match cl_peers_r {
-        Ok(n) if n >= state.cfg.cl_min_peers => Check {
-            ok: true,
-            detail: format!("{n} peers"),
-        },
-        Ok(n) => Check {
-            ok: false,
-            detail: format!("{n} peers (min {})", state.cfg.cl_min_peers),
+    }
+}
+
+fn check_el_block_fresh(r: &Result<Value, String>, max_age: u64, now: u64) -> Check {
+    match r {
+        Ok(block) => match block_number_and_age(block, now) {
+            Some((n, age)) if age <= max_age => Check {
+                ok: true,
+                detail: format!("block {n}, age {age}s"),
+            },
+            Some((n, age)) => Check {
+                ok: false,
+                detail: format!("block {n} stale: {age}s (max {max_age})"),
+            },
+            None => Check {
+                ok: false,
+                detail: "block missing fields".into(),
+            },
         },
         Err(e) => Check {
             ok: false,
-            detail: format!("node/peer_count: {e}"),
+            detail: format!("eth_getBlockByNumber: {e}"),
         },
-    };
-    let cl_slot_fresh = match &cl_status_r {
-        Ok(s) if state.cl_genesis_time == 0 => Check {
+    }
+}
+
+fn check_cl_slot_fresh(
+    r: &Result<ClStatus, String>,
+    genesis: u64,
+    seconds_per_slot: u64,
+    max_age: u64,
+    now: u64,
+) -> Check {
+    match r {
+        Ok(s) if genesis == 0 => Check {
             ok: true,
             detail: format!("slot {} (age check disabled)", s.head_slot),
         },
         Ok(s) => {
-            let expected = state.cl_genesis_time + s.head_slot * state.cl_seconds_per_slot;
-            let age = now_unix().saturating_sub(expected);
-            if age <= state.cfg.cl_max_slot_age_secs {
+            let age = slot_age(s.head_slot, genesis, seconds_per_slot, now);
+            if age <= max_age {
                 Check {
                     ok: true,
                     detail: format!("slot {}, age {age}s", s.head_slot),
@@ -187,10 +304,7 @@ pub async fn report(state: &AppState) -> Response<ResBody> {
             } else {
                 Check {
                     ok: false,
-                    detail: format!(
-                        "slot {} stale: {age}s (max {})",
-                        s.head_slot, state.cfg.cl_max_slot_age_secs
-                    ),
+                    detail: format!("slot {} stale: {age}s (max {max_age})", s.head_slot),
                 }
             }
         }
@@ -198,47 +312,107 @@ pub async fn report(state: &AppState) -> Response<ResBody> {
             ok: false,
             detail: format!("node/syncing: {e}"),
         },
-    };
+    }
+}
 
-    let all_ok = el_syncing.ok
-        && el_peers.ok
-        && el_block_fresh.ok
-        && cl_syncing.ok
-        && cl_peers.ok
-        && cl_slot_fresh.ok;
-    if !all_ok {
-        warn!(
-            el_syncing = %el_syncing.detail,
-            el_peers = %el_peers.detail,
-            el_block = %el_block_fresh.detail,
-            cl_syncing = %cl_syncing.detail,
-            cl_peers = %cl_peers.detail,
-            cl_slot = %cl_slot_fresh.detail,
-            "unhealthy"
-        );
+// ---- /healthz: verdict-free numeric snapshot ----
+
+/// Fold the five upstream probe results into a numeric snapshot. Successful
+/// signals populate their fields; failed ones are pushed onto the layer's
+/// `errors` and leave the field unset.
+#[allow(clippy::too_many_arguments)]
+fn build_snapshot(
+    sync_r: &Result<Value, String>,
+    peers_r: &Result<Value, String>,
+    block_r: &Result<Value, String>,
+    cl_status_r: &Result<ClStatus, String>,
+    cl_peers_r: &Result<u64, String>,
+    genesis: u64,
+    seconds_per_slot: u64,
+    now: u64,
+) -> HealthSnapshot {
+    let mut el = ElHealth::default();
+    match sync_r {
+        Ok(Value::Bool(false)) => el.syncing = Some(false),
+        Ok(v) => {
+            el.syncing = Some(true);
+            el.sync_distance = el_sync_distance(v);
+        }
+        Err(e) => el.errors.push(format!("eth_syncing: {e}")),
+    }
+    match peers_r {
+        Ok(Value::String(hex)) => match hex_to_u64(hex) {
+            Some(n) => el.peers = Some(n),
+            None => el.errors.push(format!("net_peerCount invalid hex: {hex}")),
+        },
+        Ok(v) => el.errors.push(format!("net_peerCount unexpected: {v}")),
+        Err(e) => el.errors.push(format!("net_peerCount: {e}")),
+    }
+    match block_r {
+        Ok(block) => match block_number_and_age(block, now) {
+            Some((num, age)) => {
+                el.block_number = Some(num);
+                el.block_age_secs = Some(age);
+            }
+            None => el
+                .errors
+                .push("eth_getBlockByNumber: missing fields".into()),
+        },
+        Err(e) => el.errors.push(format!("eth_getBlockByNumber: {e}")),
     }
 
-    let report = Report {
-        status: if all_ok { "healthy" } else { "unhealthy" },
-        el_syncing,
-        el_peers,
-        el_block_fresh,
-        cl_syncing,
-        cl_peers,
-        cl_slot_fresh,
-    };
-    let body_bytes = serde_json::to_vec(&report).unwrap_or_else(|_| b"{}".to_vec());
-    let code = if all_ok {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
+    let mut cl = ClHealth::default();
+    match cl_status_r {
+        Ok(s) => {
+            cl.syncing = Some(s.is_syncing);
+            cl.sync_distance = Some(s.sync_distance);
+            cl.head_slot = Some(s.head_slot);
+            if genesis != 0 {
+                cl.slot_age_secs = Some(slot_age(s.head_slot, genesis, seconds_per_slot, now));
+            }
+        }
+        Err(e) => cl.errors.push(format!("node/syncing: {e}")),
+    }
+    match cl_peers_r {
+        Ok(n) => cl.peers = Some(*n),
+        Err(e) => cl.errors.push(format!("node/peer_count: {e}")),
+    }
 
-    Response::builder()
-        .status(code)
-        .header("content-type", "application/json")
-        .body(box_full(Full::new(Bytes::from(body_bytes))))
-        .expect("response builder")
+    HealthSnapshot { el, cl }
+}
+
+/// `highestBlock - currentBlock` from an `eth_syncing` object, if both parse.
+fn el_sync_distance(v: &Value) -> Option<u64> {
+    let current = v
+        .get("currentBlock")
+        .and_then(Value::as_str)
+        .and_then(hex_to_u64)?;
+    let highest = v
+        .get("highestBlock")
+        .and_then(Value::as_str)
+        .and_then(hex_to_u64)?;
+    Some(highest.saturating_sub(current))
+}
+
+/// `(number, age_secs)` from an `eth_getBlockByNumber` result, or `None` if the
+/// `number` / `timestamp` fields are missing or unparseable.
+fn block_number_and_age(block: &Value, now: u64) -> Option<(u64, u64)> {
+    let ts = block
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(hex_to_u64)?;
+    let num = block
+        .get("number")
+        .and_then(Value::as_str)
+        .and_then(hex_to_u64)?;
+    Some((num, now.saturating_sub(ts)))
+}
+
+fn slot_age(head_slot: u64, genesis: u64, seconds_per_slot: u64, now: u64) -> u64 {
+    // Saturate: a garbage `head_slot` from upstream must not overflow-panic
+    // (debug) or wrap (release).
+    let expected = genesis.saturating_add(head_slot.saturating_mul(seconds_per_slot));
+    now.saturating_sub(expected)
 }
 
 async fn el_rpc(state: &AppState, payload: Bytes) -> Result<Value, String> {
@@ -397,5 +571,193 @@ mod tests {
     fn decimal_str_handles_zero() {
         let v = json!("0");
         assert_eq!(parse_decimal_str(Some(&v)), Some(0));
+    }
+
+    // ---- readiness verdicts ----
+
+    #[test]
+    fn el_syncing_false_is_synced() {
+        let c = check_el_syncing(&Ok(json!(false)));
+        assert!(c.ok);
+        assert_eq!(c.detail, "synced");
+    }
+
+    #[test]
+    fn el_syncing_object_reports_block_progress() {
+        let c = check_el_syncing(&Ok(json!({"currentBlock": "0x10", "highestBlock": "0x20"})));
+        assert!(!c.ok);
+        assert_eq!(c.detail, "syncing (block 16, distance 16)");
+    }
+
+    #[test]
+    fn el_syncing_error_is_prefixed() {
+        let c = check_el_syncing(&Err("boom".into()));
+        assert!(!c.ok);
+        assert_eq!(c.detail, "eth_syncing: boom");
+    }
+
+    #[test]
+    fn cl_syncing_synced_is_ok() {
+        let s = ClStatus {
+            head_slot: 42,
+            sync_distance: 0,
+            is_syncing: false,
+        };
+        let c = check_cl_syncing(&Ok(s));
+        assert!(c.ok);
+        assert_eq!(c.detail, "synced (slot 42, distance 0)");
+    }
+
+    #[test]
+    fn cl_syncing_in_progress_fails() {
+        let s = ClStatus {
+            head_slot: 42,
+            sync_distance: 5,
+            is_syncing: true,
+        };
+        let c = check_cl_syncing(&Ok(s));
+        assert!(!c.ok);
+        assert_eq!(c.detail, "syncing (slot 42, distance 5)");
+    }
+
+    #[test]
+    fn el_block_fresh_within_threshold_is_ok() {
+        // now = 1000, ts = 0x3e2 (994) -> age 6 <= 60
+        let block = json!({"number": "0x5", "timestamp": "0x3e2"});
+        let c = check_el_block_fresh(&Ok(block), 60, 1000);
+        assert!(c.ok);
+        assert_eq!(c.detail, "block 5, age 6s");
+    }
+
+    #[test]
+    fn el_block_fresh_past_threshold_is_stale() {
+        // now = 1000, ts = 0x384 (900) -> age 100 > 60
+        let block = json!({"number": "0x5", "timestamp": "0x384"});
+        let c = check_el_block_fresh(&Ok(block), 60, 1000);
+        assert!(!c.ok);
+        assert_eq!(c.detail, "block 5 stale: 100s (max 60)");
+    }
+
+    #[test]
+    fn cl_slot_fresh_disabled_when_genesis_zero() {
+        let s = ClStatus {
+            head_slot: 7,
+            sync_distance: 0,
+            is_syncing: false,
+        };
+        let c = check_cl_slot_fresh(&Ok(s), 0, 12, 60, 9_999_999);
+        assert!(c.ok);
+        assert_eq!(c.detail, "slot 7 (age check disabled)");
+    }
+
+    #[test]
+    fn cl_slot_fresh_past_threshold_is_stale() {
+        // genesis 1000, slot 10, 12s/slot -> expected 1120; now 1300 -> age 180 > 60
+        let s = ClStatus {
+            head_slot: 10,
+            sync_distance: 0,
+            is_syncing: false,
+        };
+        let c = check_cl_slot_fresh(&Ok(s), 1000, 12, 60, 1300);
+        assert!(!c.ok);
+        assert_eq!(c.detail, "slot 10 stale: 180s (max 60)");
+    }
+
+    #[test]
+    fn slot_age_computes_wall_clock_age() {
+        // genesis 1000, slot 10, 12s/slot -> expected 1120; now 1300 -> age 180
+        assert_eq!(slot_age(10, 1000, 12, 1300), 180);
+    }
+
+    #[test]
+    fn slot_age_saturates_on_garbage_head_slot() {
+        // A bogus head_slot from upstream must not overflow-panic or wrap.
+        assert_eq!(slot_age(u64::MAX, 1_606_824_023, 12, 2_000_000_000), 0);
+    }
+
+    // ---- /healthz numeric snapshot ----
+
+    #[test]
+    fn snapshot_reports_numeric_values_when_healthy() {
+        let snap = build_snapshot(
+            &Ok(json!(false)),
+            &Ok(json!("0x10")),
+            &Ok(json!({"number": "0x5", "timestamp": "0x3e2"})), // ts 994
+            &Ok(ClStatus {
+                head_slot: 10,
+                sync_distance: 0,
+                is_syncing: false,
+            }),
+            &Ok(64u64),
+            1000, // genesis
+            12,   // seconds_per_slot
+            1300, // now
+        );
+        assert_eq!(snap.el.syncing, Some(false));
+        assert_eq!(snap.el.peers, Some(16));
+        assert_eq!(snap.el.block_number, Some(5));
+        assert_eq!(snap.el.block_age_secs, Some(306)); // 1300 - 994
+        assert!(snap.el.errors.is_empty());
+        assert_eq!(snap.cl.syncing, Some(false));
+        assert_eq!(snap.cl.peers, Some(64));
+        assert_eq!(snap.cl.head_slot, Some(10));
+        assert_eq!(snap.cl.slot_age_secs, Some(180)); // 1300 - (1000 + 10*12)
+        assert!(snap.cl.errors.is_empty());
+    }
+
+    #[test]
+    fn snapshot_records_errors_and_omits_values_on_failure() {
+        let snap = build_snapshot(
+            &Err("timeout".to_string()),
+            &Err("http 500".to_string()),
+            &Err("timeout".to_string()),
+            &Err("http 404".to_string()),
+            &Err("http 404".to_string()),
+            1000,
+            12,
+            1300,
+        );
+        assert_eq!(snap.el.syncing, None);
+        assert_eq!(snap.el.peers, None);
+        assert_eq!(snap.el.block_number, None);
+        assert_eq!(snap.el.errors.len(), 3); // syncing, peers, block
+        assert_eq!(snap.cl.head_slot, None);
+        assert_eq!(snap.cl.errors.len(), 2); // syncing, peers
+    }
+
+    #[test]
+    fn snapshot_reports_el_sync_distance_while_syncing() {
+        let snap = build_snapshot(
+            &Ok(json!({"currentBlock": "0x10", "highestBlock": "0x20"})),
+            &Err("skip".to_string()),
+            &Err("skip".to_string()),
+            &Err("skip".to_string()),
+            &Err("skip".to_string()),
+            0,
+            12,
+            1300,
+        );
+        assert_eq!(snap.el.syncing, Some(true));
+        assert_eq!(snap.el.sync_distance, Some(16));
+    }
+
+    #[test]
+    fn snapshot_omits_cl_slot_age_when_genesis_disabled() {
+        let snap = build_snapshot(
+            &Ok(json!(false)),
+            &Ok(json!("0x10")),
+            &Ok(json!({"number": "0x5", "timestamp": "0x3e2"})),
+            &Ok(ClStatus {
+                head_slot: 10,
+                sync_distance: 0,
+                is_syncing: false,
+            }),
+            &Ok(64u64),
+            0, // genesis disabled -> no slot age
+            12,
+            1300,
+        );
+        assert_eq!(snap.cl.head_slot, Some(10));
+        assert_eq!(snap.cl.slot_age_secs, None);
     }
 }
