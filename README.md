@@ -125,10 +125,16 @@ the upstream's HTTP/1.1 WebSocket (`--el-ws-url`).
 The upstream client auto-negotiates h2 for `https://` upstreams via ALPN. A
 cleartext EL JSON-RPC upstream can't be auto-negotiated, so the health poller
 probes it: it prefers cleartext **h2c** and forwards over HTTP/2 when the upstream
-serves it (geth ≥v1.17, erigon, reth), falling back to HTTP/1.1 otherwise. No
-flag — and because the poller keeps watching, an h2c↔h1 change at the upstream
-self-heals within one poll. The CL Beacon hop stays HTTP/1.1. (The gain is mainly
-under high request concurrency; for a localhost sidecar hop it's modest.)
+serves it (geth ≥v1.17, erigon, reth), falling back to HTTP/1.1 otherwise — no
+flag. The verdict starts at h2c and is confirmed by the first poll before traffic
+is served. A running upstream that drops h2c is detected within one poll; one that
+newly adds h2c is picked up on restart (while HTTP/1.1 works it isn't re-probed).
+The data-plane follows the verdict and never retries across protocols (to avoid
+double-sending a non-idempotent call like `eth_sendRawTransaction`), so while a
+running upstream is switching away from h2c the data-plane can briefly return
+`502`s — up to one poll interval — until the verdict updates. The CL Beacon hop
+stays HTTP/1.1. (The gain is mainly under high request concurrency; for a
+localhost sidecar hop it's modest.)
 
 ethryx does **not** terminate TLS — it serves plaintext and leaves TLS to the
 LB / service mesh in front.
