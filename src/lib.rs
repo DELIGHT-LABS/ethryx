@@ -16,6 +16,7 @@ pub use config::Config;
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use hyper::service::service_fn;
@@ -44,7 +45,11 @@ where
 
     info!(?cfg, "starting ethryx");
 
-    let client = proxy::build_client();
+    let client = proxy::build_client(false);
+    // A second, HTTP/2-only client for the EL hop; the health poller decides at
+    // runtime (`el_use_h2`) whether to use it — preferring h2c and falling back
+    // to HTTP/1.1 when the upstream doesn't speak it.
+    let el_h2_client = proxy::build_client(true);
     let el_http_uri = cfg.el_http_url.parse()?;
     let cl_base = cfg.cl_beacon_url.trim_end_matches('/');
     let cl_syncing_uri = format!("{cl_base}/eth/v1/node/syncing").parse()?;
@@ -61,6 +66,8 @@ where
     let state = Arc::new(AppState {
         cfg,
         client,
+        el_h2_client,
+        el_use_h2: AtomicBool::new(true),
         el_http_uri,
         cl_syncing_uri,
         cl_peer_count_uri,

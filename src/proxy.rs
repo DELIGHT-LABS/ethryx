@@ -1,5 +1,6 @@
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -23,7 +24,7 @@ pub type ResBody = UnsyncBoxBody<Bytes, BoxError>;
 type Https = hyper_rustls::HttpsConnector<HttpConnector>;
 pub type ProxyClient = Client<Https, ResBody>;
 
-pub fn build_client() -> ProxyClient {
+pub fn build_client(force_h2: bool) -> ProxyClient {
     let mut http = HttpConnector::new();
     http.set_nodelay(true);
     http.enforce_http(false);
@@ -34,9 +35,14 @@ pub fn build_client() -> ProxyClient {
         // h2 when the upstream offers it; cleartext upstreams stay h1.
         .enable_all_versions()
         .wrap_connector(http);
-    Client::builder(TokioExecutor::new())
-        .pool_idle_timeout(Duration::from_secs(60))
-        .build(https)
+    let mut builder = Client::builder(TokioExecutor::new());
+    builder.pool_idle_timeout(Duration::from_secs(60));
+    // Cleartext h2 can't be auto-negotiated, so an opt-in h2c upstream forces
+    // HTTP/2 (prior-knowledge); an https upstream then uses h2 directly.
+    if force_h2 {
+        builder.http2_only(true);
+    }
+    builder.build(https)
 }
 
 pub async fn dispatch(
@@ -66,7 +72,7 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
         }
     }
     if req.uri().path().starts_with("/eth/") {
-        return http_proxy(req, state, &state.cfg.cl_beacon_url).await;
+        return http_proxy(req, state, &state.cfg.cl_beacon_url, &state.client).await;
     }
     // HTTP/2 Extended CONNECT WebSocket (RFC 8441): :method=CONNECT, :protocol=websocket.
     if req.method() == Method::CONNECT
@@ -81,13 +87,21 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
     if hyper_tungstenite::is_upgrade_request(&req) {
         return ws_upgrade(req, state.cfg.el_ws_url.clone(), state.cfg.proxy_timeout).await;
     }
-    http_proxy(req, state, &state.cfg.el_http_url).await
+    // The health poller decides the EL transport (h2c vs h1); the data-plane just
+    // follows its verdict.
+    let el_client = if state.el_use_h2.load(Ordering::Relaxed) {
+        &state.el_h2_client
+    } else {
+        &state.client
+    };
+    http_proxy(req, state, &state.cfg.el_http_url, el_client).await
 }
 
 async fn http_proxy(
     req: Request<Incoming>,
     state: &AppState,
     upstream_base: &str,
+    client: &ProxyClient,
 ) -> Result<Response<ResBody>, BoxError> {
     let (mut parts, body) = req.into_parts();
     let upstream_uri: Uri = {
@@ -103,7 +117,7 @@ async fn http_proxy(
     parts.version = Version::HTTP_11;
     let upstream_req = Request::from_parts(parts, box_incoming(body));
 
-    let resp = tokio::time::timeout(state.cfg.proxy_timeout, state.client.request(upstream_req))
+    let resp = tokio::time::timeout(state.cfg.proxy_timeout, client.request(upstream_req))
         .await
         .map_err(|_| -> BoxError { "upstream timeout".into() })??;
 
