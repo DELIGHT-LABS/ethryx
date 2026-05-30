@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
@@ -140,9 +141,10 @@ async fn accept_loop(
                 let svc = service_fn(move |req| proxy::dispatch(req, st.clone()));
                 let mut conn_rx = shutdown_tx.subscribe();
                 tokio::spawn(async move {
-                    let conn = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, svc)
-                        .with_upgrades();
+                    // Auto-detect HTTP/1 vs HTTP/2 (incl. cleartext h2c preface);
+                    // `_with_upgrades` keeps HTTP/1.1 WebSocket Upgrade working.
+                    let builder = auto::Builder::new(TokioExecutor::new());
+                    let conn = builder.serve_connection_with_upgrades(io, svc);
                     tokio::pin!(conn);
                     tokio::select! {
                         res = conn.as_mut() => {

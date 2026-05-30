@@ -109,6 +109,20 @@ For a **private / custom beacon chain**, pass `--network custom` together with
 explicit `--cl-genesis-time <unix>` and `--cl-seconds-per-slot <secs>`. The
 sidecar refuses to start if either is missing under `custom`.
 
+## HTTP/2
+
+ethryx serves HTTP/1.1 and HTTP/2 on the same `--listen` port — the protocol is
+auto-detected per connection. Cleartext HTTP/2 (**h2c**, prior-knowledge) is
+supported, covering the common "TLS-terminating LB / mesh forwards h2c to the
+backend" shape (Envoy, Istio, HAProxy `proto h2`); plain HTTP/1.1 and the
+HTTP/1.1 WebSocket upgrade are unchanged.
+
+The upstream client auto-negotiates h2 for `https://` upstreams via ALPN;
+cleartext upstreams stay HTTP/1.1.
+
+ethryx does **not** terminate TLS — it serves plaintext and leaves TLS to the
+LB / service mesh in front.
+
 ## Usage
 
 ```sh

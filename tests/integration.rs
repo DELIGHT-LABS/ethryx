@@ -10,7 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
-use http::{Method, Request, Response, StatusCode};
+use http::{Method, Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -58,6 +58,16 @@ fn client() -> TestClient {
     let mut http = HttpConnector::new();
     http.set_nodelay(true);
     Client::builder(TokioExecutor::new()).build::<_, TestBody>(http)
+}
+
+/// Cleartext HTTP/2 (h2c) prior-knowledge client — sends the h2 preface directly,
+/// simulating a TLS-terminating LB / mesh that forwards h2c to the backend.
+fn h2c_client() -> TestClient {
+    let mut http = HttpConnector::new();
+    http.set_nodelay(true);
+    Client::builder(TokioExecutor::new())
+        .http2_only(true)
+        .build::<_, TestBody>(http)
 }
 
 async fn get(c: &TestClient, url: &str) -> (StatusCode, Bytes) {
@@ -275,6 +285,65 @@ async fn jsonrpc_post_is_forwarded_to_el_http_upstream() {
         1,
         "expected one forwarded eth_blockNumber, saw {methods:?}"
     );
+
+    ethryx.shutdown().await;
+}
+
+// HTTP/2 downstream coverage: h1→h1 is `jsonrpc_post_is_forwarded` above; h2c→h1
+// (the LB→backend h2c shape) is below. Upstream h2 (h1→h2, h2→h2) can't be tested
+// hermetically — the production client trusts only webpki public roots, so a
+// self-signed h2 mock is rejected. Verified manually against a public h2 server:
+//   ethryx --el-http-url https://www.cloudflare.com --listen 127.0.0.1:18548 &
+//   curl -s http://127.0.0.1:18548/cdn-cgi/trace | grep http=        # h1→h2 ⇒ http/2
+//   curl -s --http2-prior-knowledge .../cdn-cgi/trace | grep http=   # h2→h2 ⇒ http/2
+#[tokio::test]
+async fn http2_h2c_jsonrpc_is_served_and_forwarded() {
+    // A prior-knowledge h2c client (the LB→backend h2c shape) is served over
+    // HTTP/2 by the auto server, and its JSON-RPC is forwarded to the EL upstream
+    // (which stays h1).
+    let el = MockServer::start(Arc::new(|req| {
+        assert_eq!(req.method, Method::POST);
+        (
+            StatusCode::OK,
+            br#"{"jsonrpc":"2.0","id":7,"result":"0xcafe"}"#.to_vec(),
+        )
+    }))
+    .await;
+    let cl = MockServer::start(ok_handler()).await;
+    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+
+    let c = h2c_client();
+    let (status, body) = post_json(
+        &c,
+        &ethryx.url("/"),
+        json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 7}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["result"], "0xcafe");
+
+    ethryx.shutdown().await;
+}
+
+#[tokio::test]
+async fn http2_h2c_negotiates_to_http2() {
+    // The response comes back over HTTP/2 → confirms the auto server actually
+    // spoke h2c (not a silent downgrade to h1).
+    let el = MockServer::start(ok_handler()).await;
+    let cl = MockServer::start(ok_handler()).await;
+    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+
+    let c = h2c_client();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(ethryx.url("/livez"))
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let resp = c.request(req).await.unwrap();
+    assert_eq!(resp.version(), Version::HTTP_2, "expected h2, got {resp:?}");
+    assert_eq!(resp.status(), StatusCode::OK);
 
     ethryx.shutdown().await;
 }
