@@ -8,8 +8,9 @@ use http::{Method, Request, Response, StatusCode, Uri, Version};
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::protocol::Role;
 use tracing::{debug, trace};
 
 use crate::headers::strip_hop_by_hop;
@@ -67,6 +68,16 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
     if req.uri().path().starts_with("/eth/") {
         return http_proxy(req, state, &state.cfg.cl_beacon_url).await;
     }
+    // HTTP/2 Extended CONNECT WebSocket (RFC 8441): :method=CONNECT, :protocol=websocket.
+    if req.method() == Method::CONNECT
+        && req
+            .extensions()
+            .get::<hyper::ext::Protocol>()
+            .is_some_and(|p| p.as_str() == "websocket")
+    {
+        return ws_upgrade_h2(req, state.cfg.el_ws_url.clone(), state.cfg.proxy_timeout).await;
+    }
+    // HTTP/1.1 Upgrade WebSocket.
     if hyper_tungstenite::is_upgrade_request(&req) {
         return ws_upgrade(req, state.cfg.el_ws_url.clone(), state.cfg.proxy_timeout).await;
     }
@@ -144,6 +155,57 @@ async fn ws_upgrade(
         bridge_ws(client_ws, upstream_ws).await;
     });
     Ok(response.map(box_full))
+}
+
+/// HTTP/2 Extended CONNECT (RFC 8441) WebSocket. The handshake differs from h1
+/// (200, not 101; no `Upgrade` header), but the tunnel carries the same RFC 6455
+/// frames — so we terminate the h2 stream, wrap it (server role), and reuse
+/// `bridge_ws` to relay to the upstream h1 WebSocket.
+async fn ws_upgrade_h2(
+    req: Request<Incoming>,
+    upstream_url: String,
+    connect_timeout: Duration,
+) -> Result<Response<ResBody>, BoxError> {
+    // Dial the upstream WebSocket first, same as the h1 path, so a dead upstream
+    // is a 502 rather than an accepted-then-dropped tunnel.
+    let upstream_ws =
+        match tokio::time::timeout(connect_timeout, connect_async(&upstream_url)).await {
+            Ok(Ok((ws, _))) => ws,
+            Ok(Err(e)) => {
+                debug!(error = %e, upstream = %upstream_url, "upstream ws connect failed");
+                return Ok(text_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!("upstream ws connect failed: {e}"),
+                ));
+            }
+            Err(_) => {
+                debug!(upstream = %upstream_url, "upstream ws connect timed out");
+                return Ok(text_response(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream ws connect timed out",
+                ));
+            }
+        };
+
+    let on_upgrade = hyper::upgrade::on(req);
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => {
+                let client_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                    TokioIo::new(upgraded),
+                    Role::Server,
+                    None,
+                )
+                .await;
+                debug!(upstream = %upstream_url, "h2 ws bridge established");
+                bridge_ws(client_ws, upstream_ws).await;
+            }
+            Err(e) => debug!(error = %e, "h2 ws upgrade failed"),
+        }
+    });
+
+    // 200 accepts the Extended CONNECT; the stream then becomes the WS tunnel.
+    Ok(text_response(StatusCode::OK, Bytes::new()))
 }
 
 async fn bridge_ws<C, U>(

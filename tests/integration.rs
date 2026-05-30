@@ -901,3 +901,115 @@ async fn ws_bridge_echoes_through_upstream() {
 
     ethryx.shutdown().await;
 }
+
+#[tokio::test]
+async fn http2_extended_connect_ws_502_when_upstream_down() {
+    // The h2 path dials the upstream first too: a dead upstream surfaces as a 502
+    // on the CONNECT response, not an accepted-then-dropped tunnel.
+    let el = MockServer::start(ok_handler()).await;
+    let cl = MockServer::start(ok_handler()).await;
+    let dead = pick_port().await;
+    let ethryx = EthryxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl.url,
+        "--el-ws-url",
+        &format!("ws://127.0.0.1:{dead}"),
+    ])
+    .await;
+
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", ethryx.port))
+        .await
+        .unwrap();
+    let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake::<_, TestBody>(TokioIo::new(tcp))
+        .await
+        .expect("h2 handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let mut req = Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("http://127.0.0.1:{}/", ethryx.port))
+        .body(Full::<Bytes>::new(Bytes::new()))
+        .unwrap();
+    req.extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+
+    let resp = sender.send_request(req).await.expect("extended CONNECT");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_GATEWAY,
+        "dead upstream → 502"
+    );
+
+    ethryx.shutdown().await;
+}
+
+#[tokio::test]
+async fn http2_extended_connect_ws_bridges_to_upstream() {
+    // RFC 8441 Extended CONNECT: an h2 client opens a WebSocket via
+    // `:method=CONNECT, :protocol=websocket`. ethryx terminates the h2 stream and
+    // bridges the RFC 6455 frames to the upstream h1 WebSocket (h2 ws → h1 ws).
+    // Driven by a hand-rolled h2 client because tokio/hyper-tungstenite are h1-only.
+    let el = MockServer::start(ok_handler()).await;
+    let cl = MockServer::start(ok_handler()).await;
+    let ws_upstream = ws_echo_upstream().await;
+    let ethryx = EthryxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl.url,
+        "--el-ws-url",
+        &ws_upstream,
+    ])
+    .await;
+
+    // Cleartext h2 (prior-knowledge) connection to ethryx.
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", ethryx.port))
+        .await
+        .unwrap();
+    let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake::<_, TestBody>(TokioIo::new(tcp))
+        .await
+        .expect("h2 handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let mut req = Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("http://127.0.0.1:{}/", ethryx.port))
+        .body(Full::<Bytes>::new(Bytes::new()))
+        .unwrap();
+    req.extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+
+    let resp = sender.send_request(req).await.expect("extended CONNECT");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "extended CONNECT should be 200"
+    );
+    assert_eq!(resp.version(), Version::HTTP_2);
+
+    let upgraded = hyper::upgrade::on(resp).await.expect("upgrade");
+    let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        TokioIo::new(upgraded),
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await;
+    ws.send(Message::Text("ping".into())).await.unwrap();
+    let echoed = loop {
+        match ws.next().await.expect("a reply").expect("ok frame") {
+            Message::Text(t) => break t,
+            _ => continue,
+        }
+    };
+    assert_eq!(echoed.as_str(), "ping");
+
+    ethryx.shutdown().await;
+}

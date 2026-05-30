@@ -117,6 +117,10 @@ supported, covering the common "TLS-terminating LB / mesh forwards h2c to the
 backend" shape (Envoy, Istio, HAProxy `proto h2`); plain HTTP/1.1 and the
 HTTP/1.1 WebSocket upgrade are unchanged.
 
+WebSocket works over both transports: the HTTP/1.1 `Upgrade` handshake and
+HTTP/2 Extended CONNECT (RFC 8441, `:protocol=websocket`). Either is bridged to
+the upstream's HTTP/1.1 WebSocket (`--el-ws-url`).
+
 The upstream client auto-negotiates h2 for `https://` upstreams via ALPN;
 cleartext upstreams stay HTTP/1.1.
 

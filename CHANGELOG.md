@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upstream client now auto-negotiates h2 for `https://` upstreams via ALPN
   (cleartext upstreams stay h1). No new flags; plaintext stays the default (TLS
   termination remains the LB/mesh's job).
+- HTTP/2 WebSocket via RFC 8441 Extended CONNECT: an h2 client (or h2 mesh) can
+  open a WebSocket with `:protocol=websocket`, which ethryx bridges to the upstream
+  h1 WebSocket. The HTTP/1.1 `Upgrade` WebSocket path is unchanged.
 - `/readyz` readiness probe and `/healthz` state snapshot, joining `/livez` as a
   three-tier probe model (liveness / readiness / monitoring), following the
   Kubernetes `livez` / `readyz` / `healthz` convention.
