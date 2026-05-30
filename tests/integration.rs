@@ -16,6 +16,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -102,6 +103,7 @@ async fn post_json(c: &TestClient, url: &str, body: Value) -> (StatusCode, Bytes
 struct RecordedRequest {
     method: Method,
     path: String,
+    version: Version,
     body: Bytes,
 }
 
@@ -113,7 +115,17 @@ struct MockServer {
 }
 
 impl MockServer {
+    /// Serve HTTP/1.1 only (rejects an h2c prior-knowledge preface).
     async fn start(handler: MockHandler) -> Self {
+        Self::serve(handler, false).await
+    }
+
+    /// Serve both HTTP/1.1 and cleartext HTTP/2 (h2c), like geth >=v1.17 / erigon.
+    async fn start_h2c(handler: MockHandler) -> Self {
+        Self::serve(handler, true).await
+    }
+
+    async fn serve(handler: MockHandler, h2: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
         let url = format!("http://{addr}");
@@ -136,10 +148,12 @@ impl MockServer {
                         async move {
                             let method = req.method().clone();
                             let path = req.uri().path().to_owned();
+                            let version = req.version();
                             let body = req.into_body().collect().await.unwrap().to_bytes();
                             let rr = RecordedRequest {
                                 method: method.clone(),
                                 path: path.clone(),
+                                version,
                                 body: body.clone(),
                             };
                             rec.lock().unwrap().push(rr.clone());
@@ -153,9 +167,15 @@ impl MockServer {
                             )
                         }
                     });
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, svc)
-                        .await;
+                    if h2 {
+                        let _ = auto::Builder::new(TokioExecutor::new())
+                            .serve_connection(io, svc)
+                            .await;
+                    } else {
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(io, svc)
+                            .await;
+                    }
                 });
             }
         });
@@ -285,6 +305,62 @@ async fn jsonrpc_post_is_forwarded_to_el_http_upstream() {
         1,
         "expected one forwarded eth_blockNumber, saw {methods:?}"
     );
+
+    // The EL mock is HTTP/1.1-only, so ethryx (which prefers h2c) detects that the
+    // h2c probe fails and falls back to HTTP/1.1 for the upstream hop.
+    let fwd = el
+        .received()
+        .into_iter()
+        .find(|r| String::from_utf8_lossy(&r.body).contains("eth_blockNumber"))
+        .expect("forwarded request recorded");
+    assert_eq!(fwd.version, Version::HTTP_11);
+
+    ethryx.shutdown().await;
+}
+
+#[tokio::test]
+async fn el_upstream_h2c_is_auto_detected() {
+    // No flag: when the EL serves h2c, the health poller detects it (it prefers
+    // h2c) and the data-plane forwards over HTTP/2. The mock records the version
+    // it received. (An h1-only EL falls back to HTTP/1.1 — covered by
+    // `jsonrpc_post_is_forwarded_to_el_http_upstream`.)
+    let el = MockServer::start_h2c(Arc::new(|_| {
+        (
+            StatusCode::OK,
+            br#"{"jsonrpc":"2.0","id":7,"result":"0xcafe"}"#.to_vec(),
+        )
+    }))
+    .await;
+    let cl = MockServer::start(ok_handler()).await;
+    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+
+    // Downstream client version is irrelevant — it's the upstream hop we assert.
+    let c = client();
+    let (status, body) = post_json(
+        &c,
+        &ethryx.url("/"),
+        json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 7}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["result"], "0xcafe");
+
+    // The EL upstream received the forwarded JSON-RPC over HTTP/2 (auto-detected).
+    let fwd = el
+        .received()
+        .into_iter()
+        .find(|r| String::from_utf8_lossy(&r.body).contains("eth_blockNumber"))
+        .expect("EL received the forwarded JSON-RPC");
+    assert_eq!(fwd.version, Version::HTTP_2);
+
+    // CL is unaffected — its hop stays HTTP/1.1.
+    let cl_req = cl
+        .received()
+        .into_iter()
+        .next()
+        .expect("CL received a health probe");
+    assert_eq!(cl_req.version, Version::HTTP_11);
 
     ethryx.shutdown().await;
 }

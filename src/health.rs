@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -9,7 +10,7 @@ use serde_json::Value;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::proxy::{ResBody, box_full};
+use crate::proxy::{ProxyClient, ResBody, box_full};
 use crate::state::AppState;
 
 /// One readiness signal: a pass/fail verdict plus a human-readable detail.
@@ -220,10 +221,14 @@ fn readiness_transition(prev_ready: Option<bool>, ready: bool) -> Transition {
 /// Query all five upstream signals once. Each call is bounded by
 /// `--health-timeout`; failures land in the result rather than aborting.
 pub(crate) async fn probe_once(state: &AppState) -> Probe {
-    let (el_syncing, el_peers, el_block, cl_status, cl_peers) = tokio::join!(
-        el_rpc(state, Bytes::from_static(SYNCING_REQ)),
-        el_rpc(state, Bytes::from_static(PEERS_REQ)),
-        el_rpc(state, Bytes::from_static(BLOCK_REQ)),
+    // eth_syncing runs first and doubles as EL transport detection: it tries the
+    // preferred client and, on a transport failure, the other — flipping
+    // `el_use_h2` so the rest of this cycle and the data-plane follow.
+    let el_syncing = el_syncing_detect(state).await;
+    let el = el_client(state);
+    let (el_peers, el_block, cl_status, cl_peers) = tokio::join!(
+        el_rpc(state, Bytes::from_static(PEERS_REQ), el),
+        el_rpc(state, Bytes::from_static(BLOCK_REQ), el),
         cl_syncing_status(state),
         cl_peer_count(state),
     );
@@ -234,6 +239,59 @@ pub(crate) async fn probe_once(state: &AppState) -> Probe {
         cl_status,
         cl_peers,
     }
+}
+
+/// The EL client picked by the current `el_use_h2` verdict.
+fn el_client(state: &AppState) -> &ProxyClient {
+    if state.el_use_h2.load(Ordering::Relaxed) {
+        &state.el_h2_client
+    } else {
+        &state.client
+    }
+}
+
+/// `eth_syncing` probe that also maintains the EL transport verdict. It sends over
+/// the preferred client; on a transport-layer failure it retries over the other
+/// and — only if that succeeds — flips `el_use_h2`. So an h2c↔h1 change is picked
+/// up within one poll, while a dead upstream (both fail) leaves the verdict as is.
+async fn el_syncing_detect(state: &AppState) -> Result<Value, String> {
+    let prefer_h2 = state.el_use_h2.load(Ordering::Relaxed);
+    let payload = Bytes::from_static(SYNCING_REQ);
+    let primary = el_rpc(state, payload.clone(), el_client(state)).await;
+    if !matches!(&primary, Err(e) if is_transport(e)) {
+        // The preferred transport reached the upstream (Ok, or an HTTP/decode
+        // error — both mean the connection itself worked); keep the verdict.
+        return primary;
+    }
+    // The preferred transport failed at the connection level — try the other one.
+    // If *it* reaches the upstream, the upstream changed protocols, so switch. If
+    // it too fails at the transport level the upstream is simply down, so keep the
+    // verdict and report the original error.
+    let other = if prefer_h2 {
+        &state.client
+    } else {
+        &state.el_h2_client
+    };
+    let alt = el_rpc(state, payload, other).await;
+    if matches!(&alt, Err(e) if is_transport(e)) {
+        return primary; // both transports failed → upstream down
+    }
+    state.el_use_h2.store(!prefer_h2, Ordering::Relaxed);
+    if prefer_h2 {
+        warn!("EL JSON-RPC upstream stopped speaking h2c — using HTTP/1.1");
+    } else {
+        info!("EL JSON-RPC upstream speaks h2c — using HTTP/2");
+    }
+    alt
+}
+
+/// A hard transport/connection failure (vs. a timeout, HTTP status, or decode
+/// error) — the only signal that the chosen HTTP version is wrong for this
+/// upstream. A timeout is deliberately excluded: it's ambiguous (a slow upstream),
+/// and because the verdict is sticky, letting a transient timeout trigger a switch
+/// would strand us on the wrong protocol until restart.
+fn is_transport(e: &str) -> bool {
+    e.starts_with("transport:")
 }
 
 /// Refresh the shared [`Probe`] until shutdown: poll, then sleep `interval`,
@@ -519,8 +577,12 @@ fn slot_age(head_slot: u64, genesis: u64, seconds_per_slot: u64, now: u64) -> u6
 
 /// Send a prepared probe request with the health-poll timeout and return the
 /// body of a successful response. Shared by the EL JSON-RPC and CL REST probes.
-async fn fetch_bytes(state: &AppState, req: Request<ResBody>) -> Result<Bytes, String> {
-    let resp = tokio::time::timeout(state.cfg.health_timeout, state.client.request(req))
+async fn fetch_bytes(
+    state: &AppState,
+    req: Request<ResBody>,
+    client: &ProxyClient,
+) -> Result<Bytes, String> {
+    let resp = tokio::time::timeout(state.cfg.health_timeout, client.request(req))
         .await
         .map_err(|_| "timeout".to_string())?
         .map_err(|e| format!("transport: {e}"))?;
@@ -534,14 +596,14 @@ async fn fetch_bytes(state: &AppState, req: Request<ResBody>) -> Result<Bytes, S
         .map_err(|e| format!("read: {e}"))
 }
 
-async fn el_rpc(state: &AppState, payload: Bytes) -> Result<Value, String> {
+async fn el_rpc(state: &AppState, payload: Bytes, client: &ProxyClient) -> Result<Value, String> {
     let req = Request::builder()
         .method(Method::POST)
         .uri(state.el_http_uri.clone())
         .header("content-type", "application/json")
         .body(box_full(Full::new(payload)))
         .map_err(|e| format!("build: {e}"))?;
-    let body = fetch_bytes(state, req).await?;
+    let body = fetch_bytes(state, req, client).await?;
     let v: Value = serde_json::from_slice(&body).map_err(|e| format!("decode: {e}"))?;
     if let Some(err) = v.get("error") {
         return Err(format!("rpc error: {err}"));
@@ -580,7 +642,7 @@ async fn cl_get_json(state: &AppState, uri: &Uri) -> Result<Value, String> {
         .uri(uri.clone())
         .body(box_full(Full::new(Bytes::new())))
         .map_err(|e| format!("build: {e}"))?;
-    let body = fetch_bytes(state, req).await?;
+    let body = fetch_bytes(state, req, &state.client).await?;
     serde_json::from_slice(&body).map_err(|e| format!("decode: {e}"))
 }
 
