@@ -142,8 +142,11 @@ async fn accept_loop(
                 let mut conn_rx = shutdown_tx.subscribe();
                 tokio::spawn(async move {
                     // Auto-detect HTTP/1 vs HTTP/2 (incl. cleartext h2c preface);
-                    // `_with_upgrades` keeps HTTP/1.1 WebSocket Upgrade working.
-                    let builder = auto::Builder::new(TokioExecutor::new());
+                    // `_with_upgrades` keeps HTTP/1.1 WebSocket Upgrade working;
+                    // `enable_connect_protocol` advertises RFC 8441 Extended CONNECT
+                    // (HTTP/2 WebSocket).
+                    let mut builder = auto::Builder::new(TokioExecutor::new());
+                    builder.http2().enable_connect_protocol();
                     let conn = builder.serve_connection_with_upgrades(io, svc);
                     tokio::pin!(conn);
                     tokio::select! {
