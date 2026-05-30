@@ -36,6 +36,9 @@ pub struct HealthSnapshot {
 
 #[derive(Serialize, Default)]
 pub struct ElHealth {
+    /// HTTP version ethryx uses for this upstream hop: `h2c` / `h2` / `http/1.1`.
+    /// Reflects the poller's auto-detected EL transport verdict.
+    pub transport: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub syncing: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -52,6 +55,11 @@ pub struct ElHealth {
 
 #[derive(Serialize, Default)]
 pub struct ClHealth {
+    /// HTTP version ethryx uses for the Beacon hop. The CL hop never uses h2c
+    /// prior-knowledge, so a cleartext upstream is always `http/1.1`; an `https`
+    /// upstream may negotiate `h2` via ALPN, which is not separately tracked and
+    /// is reported conservatively as `http/1.1`.
+    pub transport: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub syncing: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -125,7 +133,7 @@ const BLOCK_REQ: &[u8] =
 /// request. Intended for dashboards / alerting; use [`ready`] as the LB gate.
 pub fn report(state: &AppState) -> Response<ResBody> {
     let probe = state.probe.borrow().clone();
-    let snapshot = build_snapshot(
+    let mut snapshot = build_snapshot(
         &probe.el_syncing,
         &probe.el_peers,
         &probe.el_block,
@@ -135,7 +143,23 @@ pub fn report(state: &AppState) -> Response<ResBody> {
         state.cl_seconds_per_slot,
         now_unix(),
     );
+    snapshot.el.transport = transport_label(
+        state.el_use_h2.load(Ordering::Relaxed),
+        state.el_http_uri.scheme_str(),
+    );
+    // The CL hop always uses the default client (never h2c prior-knowledge).
+    snapshot.cl.transport = transport_label(false, state.cl_syncing_uri.scheme_str());
     json_response(StatusCode::OK, &snapshot)
+}
+
+/// HTTP-version label for an upstream hop from whether ethryx selected HTTP/2 and
+/// whether the upstream is TLS. Cleartext h2 is `h2c`; h2 over TLS is `h2`.
+fn transport_label(uses_h2: bool, scheme: Option<&str>) -> &'static str {
+    match (uses_h2, scheme == Some("https")) {
+        (true, true) => "h2",
+        (true, false) => "h2c",
+        (false, _) => "http/1.1",
+    }
 }
 
 /// `/readyz` — load-balancer readiness gate. 200 when ready, else 503.
