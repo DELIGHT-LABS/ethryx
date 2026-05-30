@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- HTTP/2 support: the listener serves HTTP/1.1 and HTTP/2 on the same port,
+  auto-detected per connection — including cleartext **h2c** via prior-knowledge,
+  which covers the common "TLS-terminating LB / mesh forwards h2c to the backend"
+  shape (Envoy, Istio, HAProxy `proto h2`). h1 and h1 WebSocket are unchanged. The
+  upstream client now auto-negotiates h2 for `https://` upstreams via ALPN
+  (cleartext upstreams stay h1). No new flags; plaintext stays the default (TLS
+  termination remains the LB/mesh's job).
 - `/readyz` readiness probe and `/healthz` state snapshot, joining `/livez` as a
   three-tier probe model (liveness / readiness / monitoring), following the
   Kubernetes `livez` / `readyz` / `healthz` convention.

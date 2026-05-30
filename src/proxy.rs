@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use http::{Method, Request, Response, StatusCode, Uri};
+use http::{Method, Request, Response, StatusCode, Uri, Version};
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
@@ -29,7 +29,9 @@ pub fn build_client() -> ProxyClient {
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_webpki_roots()
         .https_or_http()
-        .enable_http1()
+        // ALPN advertises ["h2","http/1.1"] for https upstreams → auto-negotiate
+        // h2 when the upstream offers it; cleartext upstreams stay h1.
+        .enable_all_versions()
         .wrap_connector(http);
     Client::builder(TokioExecutor::new())
         .pool_idle_timeout(Duration::from_secs(60))
@@ -84,6 +86,10 @@ async fn http_proxy(
     parts.uri = upstream_uri;
     strip_hop_by_hop(&mut parts.headers);
     parts.extensions.clear();
+    // The inbound version (e.g. HTTP/2) must not be forced onto the upstream
+    // connection — normalize so the client uses whatever the upstream negotiates
+    // (h1 for cleartext, h2 via ALPN for an https upstream).
+    parts.version = Version::HTTP_11;
     let upstream_req = Request::from_parts(parts, box_incoming(body));
 
     let resp = tokio::time::timeout(state.cfg.proxy_timeout, state.client.request(upstream_req))
