@@ -362,6 +362,12 @@ async fn el_upstream_h2c_is_auto_detected() {
         .expect("CL received a health probe");
     assert_eq!(cl_req.version, Version::HTTP_11);
 
+    // /healthz surfaces the detected upstream transport per layer.
+    let (_, hz) = get(&c, &ethryx.url("/healthz")).await;
+    let hv: Value = serde_json::from_slice(&hz).unwrap();
+    assert_eq!(hv["el"]["transport"], "h2c");
+    assert_eq!(hv["cl"]["transport"], "http/1.1");
+
     ethryx.shutdown().await;
 }
 
@@ -517,6 +523,10 @@ async fn healthz_is_200_even_when_upstreams_fail() {
             .any(|e| e.as_str().unwrap().contains("404")),
         "got {v}"
     );
+    // Transport is reported even when the health probes themselves error: the
+    // h1-only mock rejects the h2c probe, so the EL hop falls back to http/1.1.
+    assert_eq!(v["el"]["transport"], "http/1.1");
+    assert_eq!(v["cl"]["transport"], "http/1.1");
 
     ethryx.shutdown().await;
 }

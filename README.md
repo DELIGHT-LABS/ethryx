@@ -63,6 +63,7 @@ that layer's `errors` array.
 
 | Field                                              | Source                                |
 |----------------------------------------------------|---------------------------------------|
+| `el.transport` / `cl.transport` (`h2c`/`h2`/`http/1.1`) | upstream HTTP version ethryx uses |
 | `el.syncing` (`false` = synced)                    | EL `eth_syncing`                      |
 | `el.sync_distance` (while syncing)                 | EL `eth_syncing` highest − current    |
 | `el.peers`                                         | EL `net_peerCount`                    |
@@ -73,8 +74,8 @@ that layer's `errors` array.
 | `el.errors` / `cl.errors`                          | any upstream call that failed         |
 
 ```json
-{ "el": { "syncing": false, "peers": 23, "block_number": 21000000, "block_age_secs": 5 },
-  "cl": { "syncing": false, "sync_distance": 0, "peers": 78, "head_slot": 9412341, "slot_age_secs": 3 } }
+{ "el": { "transport": "h2c", "syncing": false, "peers": 23, "block_number": 21000000, "block_age_secs": 5 },
+  "cl": { "transport": "http/1.1", "syncing": false, "sync_distance": 0, "peers": 78, "head_slot": 9412341, "slot_age_secs": 3 } }
 ```
 
 CL slot age is derived from `head_slot * --cl-seconds-per-slot +

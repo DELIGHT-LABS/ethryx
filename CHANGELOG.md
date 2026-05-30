@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it (geth ≥v1.17, erigon, reth), falling back to HTTP/1.1 otherwise. No flag, and
   an h2c↔h1 change at the upstream self-heals within one poll. The CL Beacon hop
   stays HTTP/1.1, and `https://` EL upstreams continue to negotiate h2 via ALPN.
+- `/healthz` now reports the upstream HTTP `transport` per layer (`h2c` / `h2` /
+  `http/1.1`), so the auto-detected EL transport is observable.
 - `/readyz` readiness probe and `/healthz` state snapshot, joining `/livez` as a
   three-tier probe model (liveness / readiness / monitoring), following the
   Kubernetes `livez` / `readyz` / `healthz` convention.
