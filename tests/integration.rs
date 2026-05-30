@@ -532,6 +532,45 @@ async fn healthz_is_200_even_when_upstreams_fail() {
 }
 
 #[tokio::test]
+async fn el_down_keeps_default_h2c_verdict_and_502s() {
+    // EL upstream down: both the h2c probe and the h1 fallback fail at the
+    // transport layer, so the poller keeps the default (h2c) verdict instead of
+    // flapping to h1. /healthz still answers 200 with the EL error inline and
+    // reports the unconfirmed default transport; the data-plane returns 502.
+    let dead = pick_port().await; // bound then released -> nothing listening
+    let cl = MockServer::start(ok_handler()).await;
+    let ethryx = EthryxHandle::start(&[
+        "--el-http-url",
+        &format!("http://127.0.0.1:{dead}"),
+        "--cl-beacon-url",
+        &cl.url,
+    ])
+    .await;
+
+    let c = client();
+    let (status, body) = get(&c, &ethryx.url("/healthz")).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    let el_errors = v["el"]["errors"].as_array().expect("el.errors array");
+    assert!(!el_errors.is_empty(), "expected an EL error, got {v}");
+    assert_eq!(
+        v["el"]["transport"], "h2c",
+        "a down EL keeps the default verdict"
+    );
+
+    // The data-plane forwards to the (dead) EL and surfaces a 502.
+    let (status, _) = post_json(
+        &c,
+        &ethryx.url("/"),
+        json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    ethryx.shutdown().await;
+}
+
+#[tokio::test]
 async fn healthz_is_served_from_cache_not_per_request() {
     // With a long poll interval, only the startup poll hits upstream. Repeated
     // /healthz requests must read the cached snapshot and add no upstream calls.

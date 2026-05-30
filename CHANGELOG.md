@@ -22,8 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   h1 WebSocket. The HTTP/1.1 `Upgrade` WebSocket path is unchanged.
 - EL JSON-RPC upstream h2c auto-detection: the health poller probes the EL hop
   (preferring cleartext **h2c**) and forwards over HTTP/2 when the upstream serves
-  it (geth ≥v1.17, erigon, reth), falling back to HTTP/1.1 otherwise. No flag, and
-  an h2c↔h1 change at the upstream self-heals within one poll. The CL Beacon hop
+  it (geth ≥v1.17, erigon, reth), falling back to HTTP/1.1 otherwise. No flag. If a
+  running upstream stops serving h2c, the poller falls back within one poll; a
+  cleartext upstream that newly adds h2c is picked up on restart. The CL Beacon hop
   stays HTTP/1.1, and `https://` EL upstreams continue to negotiate h2 via ALPN.
 - `/healthz` now reports the upstream HTTP `transport` per layer (`h2c` / `h2` /
   `http/1.1`), so the auto-detected EL transport is observable.
