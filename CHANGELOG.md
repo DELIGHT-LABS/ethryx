@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+## [0.1.2] - 2026-05-31
+
 ### Added
 
 - HTTP/2 support: the listener serves HTTP/1.1 and HTTP/2 on the same port,

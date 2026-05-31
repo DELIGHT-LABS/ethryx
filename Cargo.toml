@@ -1,6 +1,6 @@
 [package]
 name = "ethryx"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.95"
 description = "Lightweight Rust sidecar multiplexing HTTP/WS and surfacing health for Ethereum EL/CL nodes."
