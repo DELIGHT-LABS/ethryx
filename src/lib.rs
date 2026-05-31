@@ -16,9 +16,11 @@ pub use config::Config;
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use hyper::body::Incoming;
+use hyper::http::Request;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
@@ -43,7 +45,7 @@ where
         return Err("health-poll-interval must be at least 1 second".into());
     }
 
-    info!(?cfg, "starting ethryx");
+    info!(version = env!("CARGO_PKG_VERSION"), ?cfg, "starting ethryx");
 
     let client = proxy::build_client(false);
     // A second, HTTP/2-only client for the EL hop; the health poller decides at
@@ -143,9 +145,19 @@ async fn accept_loop(
                 if let Err(e) = stream.set_nodelay(true) {
                     debug!(error = %e, "set_nodelay failed");
                 }
+                info!(%peer, "connection accepted");
                 let io = TokioIo::new(stream);
                 let st = state.clone();
-                let svc = service_fn(move |req| proxy::dispatch(req, st.clone()));
+                // Log the negotiated protocol once per connection. `auto::Builder`
+                // doesn't expose its h1/h2 choice, but the first request's version
+                // is that choice, so latch it on the first dispatch.
+                let logged_proto = Arc::new(AtomicBool::new(false));
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    if !logged_proto.swap(true, Ordering::Relaxed) {
+                        info!(%peer, version = ?req.version(), "connection negotiated");
+                    }
+                    proxy::dispatch(req, st.clone())
+                });
                 let mut conn_rx = shutdown_tx.subscribe();
                 tokio::spawn(async move {
                     // Auto-detect HTTP/1 vs HTTP/2 (incl. cleartext h2c preface);
@@ -158,14 +170,16 @@ async fn accept_loop(
                     tokio::pin!(conn);
                     tokio::select! {
                         res = conn.as_mut() => {
-                            if let Err(e) = res {
-                                debug!(error = %e, %peer, "connection ended");
+                            match res {
+                                Ok(()) => info!(%peer, "connection closed"),
+                                Err(e) => info!(error = %e, %peer, "connection closed"),
                             }
                         }
                         _ = conn_rx.changed() => {
                             conn.as_mut().graceful_shutdown();
-                            if let Err(e) = conn.await {
-                                debug!(error = %e, %peer, "connection ended after shutdown");
+                            match conn.await {
+                                Ok(()) => info!(%peer, "connection closed after shutdown"),
+                                Err(e) => info!(error = %e, %peer, "connection closed after shutdown"),
                             }
                         }
                     }
