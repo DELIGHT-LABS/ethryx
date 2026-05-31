@@ -41,6 +41,25 @@ async fn pick_port() -> u16 {
     port
 }
 
+/// POST a JSON-RPC and retry briefly while the response is `502`. The very first
+/// data-plane request to an h2c upstream may establish a fresh HTTP/2 connection,
+/// which can momentarily exceed the test's short `--proxy-timeout` on a heavily
+/// loaded (cold-start) CI runner; a steady-state sidecar keeps the pool warm. This
+/// mirrors ethryx's documented behaviour that a transport in flux can briefly
+/// surface a `502` until it settles, so it doesn't mask a real failure (a
+/// persistent `502` still fails the test).
+async fn post_json_settled(c: &TestClient, url: &str, body: Value) -> (StatusCode, Bytes) {
+    let mut last = (StatusCode::BAD_GATEWAY, Bytes::new());
+    for _ in 0..50 {
+        last = post_json(c, url, body.clone()).await;
+        if last.0 != StatusCode::BAD_GATEWAY {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    last
+}
+
 /// Poll until the given port accepts connections.
 async fn wait_for_port(port: u16) {
     for _ in 0..100 {
@@ -336,7 +355,7 @@ async fn el_upstream_h2c_is_auto_detected() {
 
     // Downstream client version is irrelevant — it's the upstream hop we assert.
     let c = client();
-    let (status, body) = post_json(
+    let (status, body) = post_json_settled(
         &c,
         &ethryx.url("/"),
         json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 7}),
