@@ -177,14 +177,17 @@ Structured JSON to stdout. Levels follow a sidecar-appropriate discipline:
 |---------|---------------------------------------------------------------------|
 | `error` | genuine internal faults                                             |
 | `warn`  | readiness became **not-ready** (LB will deroute); `accept()` failed |
-| `info`  | lifecycle (start / listen / shutdown) and readiness **recovered**  |
+| `info`  | lifecycle (start w/ version / listen / shutdown), readiness **recovered**, the EL upstream h2c↔h1 switch, and per-connection accept / negotiated protocol / close |
 | `debug` | routine activity: per-request proxy / WS outcomes, each health poll |
 | `trace` | fine-grained internal flow (request routing)                        |
 
-Routine upstream / client failures (a 502, a dropped WebSocket) are `debug`, not
-`error` — for a sidecar they are everyday. Readiness *changes* are logged once by
-the poller (not per probe), so the default `info` output stays quiet until
-something actually changes.
+At `info` you get the boot line (with the ethryx version) and one line per
+connection — `accepted` (peer), `negotiated` (the auto-detected `HTTP/1.1` vs
+`HTTP/2`), and `closed` — but **not** per-request lines, so a busy sidecar stays
+readable. Routine upstream / client failures (a 502, a dropped WebSocket) are
+`debug`, not `error` — for a sidecar they are everyday. Readiness *changes* are
+logged once by the poller (not per probe), so the default `info` output stays
+quiet until something actually changes.
 
 Set the level with `--log-level <trace|debug|info|warn|error>` (default `info`).
 `RUST_LOG` overrides it and allows per-target directives:

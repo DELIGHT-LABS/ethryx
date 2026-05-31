@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+### Added
+
+- More observable `info` logging: the boot line now includes the ethryx version,
+  and each connection logs one line on accept (peer), on first request
+  (the negotiated `HTTP/1.1` vs `HTTP/2`), and on close. Per-request logging stays
+  at `debug`, so a busy sidecar's `info` output remains readable.
+
 ## [0.1.2] - 2026-05-31
 
 ### Added
