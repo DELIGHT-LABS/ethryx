@@ -43,7 +43,12 @@ where
         return Err("health-poll-interval must be at least 1 second".into());
     }
 
-    info!(?cfg, "starting ethryx");
+    info!(
+        version = concat!("v", env!("CARGO_PKG_VERSION")),
+        git = env!("ETHRYX_GIT_DESCRIBE"),
+        ?cfg,
+        "starting ethryx"
+    );
 
     let client = proxy::build_client(false);
     // A second, HTTP/2-only client for the EL hop; the health poller decides at
