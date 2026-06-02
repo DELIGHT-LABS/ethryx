@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+### Added
+
+- The boot log line now includes the ethryx `version` (e.g. `v0.1.2`) and a `git`
+  field from build-time `git describe`, so a tagged release (`git` = `v0.1.2`) is
+  distinguishable from an ad-hoc build off a later commit
+  (`v0.1.2-5-g20537f9`, `-dirty` when the tree was modified). No new dependency —
+  a small `build.rs` captures it; `git` is `unknown` without a git checkout.
+- `--access-log` (`ETHRYX_ACCESS_LOG`): an opt-in per-connection access log on a
+  dedicated `access_log` target — peer, the negotiated `HTTP/1.1` vs `HTTP/2`, and
+  the first request's method and path. The target sits outside the `ethryx`
+  hierarchy, so raising the app log doesn't pull it in. Kept separate from the
+  application log so `info` stays quiet by default, and health-probe paths
+  (`/livez`, `/readyz`, `/healthz`) are excluded so frequent k8s / LB checks don't
+  bury real traffic.
+
+### Changed
+
+- `info` logging stays reserved for lifecycle and state-change events; per-request
+  proxy / WS outcomes and connection errors are `debug`, and connection accept /
+  close are `trace`. A healthy sidecar is near-silent at `info` between changes.
+
 ## [0.1.2] - 2026-05-31
 
 ### Added

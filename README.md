@@ -177,14 +177,22 @@ Structured JSON to stdout. Levels follow a sidecar-appropriate discipline:
 |---------|---------------------------------------------------------------------|
 | `error` | genuine internal faults                                             |
 | `warn`  | readiness became **not-ready** (LB will deroute); `accept()` failed |
-| `info`  | lifecycle (start / listen / shutdown) and readiness **recovered**  |
-| `debug` | routine activity: per-request proxy / WS outcomes, each health poll |
-| `trace` | fine-grained internal flow (request routing)                        |
+| `info`  | lifecycle (start w/ version / listen / shutdown), readiness **recovered**, the EL upstream h2c↔h1 switch |
+| `debug` | routine activity: per-request proxy / WS outcomes, each health poll, connection errors |
+| `trace` | fine-grained internal flow (request routing, connection accept / close) |
 
-Routine upstream / client failures (a 502, a dropped WebSocket) are `debug`, not
-`error` — for a sidecar they are everyday. Readiness *changes* are logged once by
-the poller (not per probe), so the default `info` output stays quiet until
-something actually changes.
+`info` is reserved for notable, low-frequency events, so a healthy sidecar is
+nearly silent between state changes — request rates and latencies belong in
+metrics, not one log line per request. Routine upstream / client failures (a 502,
+a dropped WebSocket) are `debug`, not `error` — for a sidecar they are everyday.
+Readiness *changes* are logged once by the poller (not per probe).
+
+The startup line carries two version fields: `version` (the crate version, e.g.
+`v0.1.2`) and `git` (the build's `git describe`). For a tagged release the two
+match (`git` is `v0.1.2`); an ad-hoc build off a later commit shows
+`v0.1.2-5-g20537f9`, with a `-dirty` suffix when the tree had uncommitted
+changes — so a binary's exact provenance is always visible in its logs. (`git`
+is `unknown` when built without a git checkout, e.g. from a source tarball.)
 
 Set the level with `--log-level <trace|debug|info|warn|error>` (default `info`).
 `RUST_LOG` overrides it and allows per-target directives:
@@ -192,6 +200,27 @@ Set the level with `--log-level <trace|debug|info|warn|error>` (default `info`).
 ```sh
 ethryx --log-level debug ...
 RUST_LOG=ethryx=debug,hyper=warn ethryx ...
+```
+
+### Access log
+
+For a per-connection trail — peer, the negotiated `HTTP/1.1` vs `HTTP/2`, and the
+first request's method and path — enable `--access-log` (`ETHRYX_ACCESS_LOG`). It
+emits one line per connection on a dedicated `access_log` target, kept separate
+from the application log (the nginx / Envoy / Caddy split) so the `info` stream
+stays quiet by default. Health-probe paths (`/livez`, `/readyz`, `/healthz`) are
+**excluded** even when it's on, so frequent k8s / LB checks don't bury real
+traffic.
+
+The `access_log` target is deliberately *not* under `ethryx`, so raising the app
+log (`--log-level debug`, or `RUST_LOG=ethryx=debug`) does **not** turn it on —
+the access log is controlled only by `--access-log` or by naming its target
+directly. When `RUST_LOG` is set it takes over the whole filter (the
+`--access-log` flag is then ignored), so name the target there if you want it:
+
+```sh
+ethryx --access-log ...
+RUST_LOG=ethryx=debug,access_log=info ethryx ...
 ```
 
 ## systemd

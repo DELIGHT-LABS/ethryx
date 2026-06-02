@@ -124,6 +124,21 @@ pub struct Config {
     )]
     pub log_level: String,
 
+    /// Emit a per-connection access log (one line per connection: peer, the
+    /// negotiated HTTP version, method and path) on the `access_log` target.
+    /// Off by default — the main log stays quiet at `info` (lifecycle and state
+    /// changes only); health-probe paths are excluded even when this is on.
+    /// `RUST_LOG` can target it directly, e.g. `RUST_LOG=access_log=info`.
+    #[arg(
+        long,
+        env = "ETHRYX_ACCESS_LOG",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub access_log: bool,
+
     /// Upstream timeout for proxied requests (seconds).
     #[arg(long, env = "ETHRYX_PROXY_TIMEOUT", default_value = "60", value_parser = parse_secs)]
     pub proxy_timeout: Duration,
@@ -273,6 +288,16 @@ mod tests {
     #[test]
     fn log_level_defaults_to_info() {
         assert_eq!(parse(&[]).log_level, "info");
+    }
+
+    #[test]
+    fn access_log_defaults_off() {
+        assert!(!parse(&[]).access_log);
+    }
+
+    #[test]
+    fn access_log_bare_flag_enables() {
+        assert!(parse(&["--access-log"]).access_log);
     }
 
     #[test]

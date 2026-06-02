@@ -16,15 +16,17 @@ pub use config::Config;
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use hyper::body::Incoming;
+use hyper::http::Request;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::state::AppState;
 
@@ -124,6 +126,12 @@ where
     Ok(())
 }
 
+/// Health-probe paths, excluded from the access log: k8s liveness/readiness and
+/// LB checks hit these every few seconds, so logging them would bury real traffic.
+fn is_probe_path(path: &str) -> bool {
+    matches!(path, "/livez" | "/readyz" | "/healthz")
+}
+
 async fn accept_loop(
     listener: TcpListener,
     state: Arc<AppState>,
@@ -148,9 +156,32 @@ async fn accept_loop(
                 if let Err(e) = stream.set_nodelay(true) {
                     debug!(error = %e, "set_nodelay failed");
                 }
+                // Connection lifecycle is fine-grained, high-frequency detail, so
+                // it lives at trace (accept/close) and on a dedicated `access_log`
+                // target (the negotiated protocol + first request line) rather
+                // than the main info log — which stays reserved for lifecycle and
+                // state changes. See the `access_log` config flag.
+                trace!(%peer, "connection accepted");
                 let io = TokioIo::new(stream);
                 let st = state.clone();
-                let svc = service_fn(move |req| proxy::dispatch(req, st.clone()));
+                // `auto::Builder` doesn't expose its h1/h2 choice, but the first
+                // request's version is that choice, so log one access line on the
+                // first dispatch — skipping health-probe paths so frequent k8s/LB
+                // checks don't drown the access log.
+                let logged = Arc::new(AtomicBool::new(false));
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    if !logged.swap(true, Ordering::Relaxed) && !is_probe_path(req.uri().path()) {
+                        info!(
+                            target: "access_log",
+                            %peer,
+                            version = ?req.version(),
+                            method = %req.method(),
+                            path = req.uri().path(),
+                            "connection",
+                        );
+                    }
+                    proxy::dispatch(req, st.clone())
+                });
                 let mut conn_rx = shutdown_tx.subscribe();
                 tokio::spawn(async move {
                     // Auto-detect HTTP/1 vs HTTP/2 (incl. cleartext h2c preface);
@@ -163,14 +194,16 @@ async fn accept_loop(
                     tokio::pin!(conn);
                     tokio::select! {
                         res = conn.as_mut() => {
-                            if let Err(e) = res {
-                                debug!(error = %e, %peer, "connection ended");
+                            match res {
+                                Ok(()) => trace!(%peer, "connection closed"),
+                                Err(e) => debug!(error = %e, %peer, "connection closed"),
                             }
                         }
                         _ = conn_rx.changed() => {
                             conn.as_mut().graceful_shutdown();
-                            if let Err(e) = conn.await {
-                                debug!(error = %e, %peer, "connection ended after shutdown");
+                            match conn.await {
+                                Ok(()) => trace!(%peer, "connection closed after shutdown"),
+                                Err(e) => debug!(error = %e, %peer, "connection closed after shutdown"),
                             }
                         }
                     }
