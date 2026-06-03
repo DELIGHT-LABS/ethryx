@@ -126,6 +126,71 @@ async fn http_proxy(
     Ok(Response::from_parts(resp_parts, box_incoming(resp_body)))
 }
 
+fn build_ws_request(req: &Request<Incoming>, upstream_url: &str) -> Result<Request<()>, BoxError> {
+    let req_pq = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let target_uri = format!("{}{}", upstream_url.trim_end_matches('/'), req_pq);
+    let parsed_uri: http::Uri = target_uri.parse()?;
+
+    let mut upstream_req = Request::builder()
+        .method(Method::GET)
+        .uri(&target_uri)
+        .body(())?;
+
+    // Copy headers from client request
+    *upstream_req.headers_mut() = req.headers().clone();
+
+    // Strip host and content-length, but keep Connection and Upgrade
+    upstream_req.headers_mut().remove(http::header::HOST);
+    upstream_req
+        .headers_mut()
+        .remove(http::header::CONTENT_LENGTH);
+
+    // Re-insert correct Host header for upstream
+    if let Some(auth) = parsed_uri.authority() {
+        upstream_req.headers_mut().insert(
+            http::header::HOST,
+            http::HeaderValue::from_str(auth.as_str())?,
+        );
+    }
+
+    // Ensure Sec-WebSocket-Key and Sec-WebSocket-Version are present for HTTP/1.1 upstream handshake
+    if !upstream_req
+        .headers()
+        .contains_key(http::header::SEC_WEBSOCKET_KEY)
+    {
+        let key = tokio_tungstenite::tungstenite::handshake::client::generate_key();
+        upstream_req.headers_mut().insert(
+            http::header::SEC_WEBSOCKET_KEY,
+            http::HeaderValue::from_str(&key)?,
+        );
+    }
+    if !upstream_req
+        .headers()
+        .contains_key(http::header::SEC_WEBSOCKET_VERSION)
+    {
+        upstream_req.headers_mut().insert(
+            http::header::SEC_WEBSOCKET_VERSION,
+            http::HeaderValue::from_static("13"),
+        );
+    }
+
+    // Ensure Connection and Upgrade are correct
+    upstream_req.headers_mut().insert(
+        http::header::CONNECTION,
+        http::HeaderValue::from_static("Upgrade"),
+    );
+    upstream_req.headers_mut().insert(
+        http::header::UPGRADE,
+        http::HeaderValue::from_static("websocket"),
+    );
+
+    Ok(upstream_req)
+}
+
 async fn ws_upgrade(
     mut req: Request<Incoming>,
     upstream_url: String,
@@ -137,24 +202,24 @@ async fn ws_upgrade(
     // reason. Connecting first lets a dead or slow upstream surface as a 502 on
     // the handshake instead — and bounds the dial so a hung upstream can't leak
     // a half-open client connection.
-    let upstream_ws =
-        match tokio::time::timeout(connect_timeout, connect_async(&upstream_url)).await {
-            Ok(Ok((ws, _))) => ws,
-            Ok(Err(e)) => {
-                debug!(error = %e, upstream = %upstream_url, "upstream ws connect failed");
-                return Ok(text_response(
-                    StatusCode::BAD_GATEWAY,
-                    format!("upstream ws connect failed: {e}"),
-                ));
-            }
-            Err(_) => {
-                debug!(upstream = %upstream_url, "upstream ws connect timed out");
-                return Ok(text_response(
-                    StatusCode::BAD_GATEWAY,
-                    "upstream ws connect timed out",
-                ));
-            }
-        };
+    let ws_req = build_ws_request(&req, &upstream_url)?;
+    let upstream_ws = match tokio::time::timeout(connect_timeout, connect_async(ws_req)).await {
+        Ok(Ok((ws, _))) => ws,
+        Ok(Err(e)) => {
+            debug!(error = %e, upstream = %upstream_url, "upstream ws connect failed");
+            return Ok(text_response(
+                StatusCode::BAD_GATEWAY,
+                format!("upstream ws connect failed: {e}"),
+            ));
+        }
+        Err(_) => {
+            debug!(upstream = %upstream_url, "upstream ws connect timed out");
+            return Ok(text_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream ws connect timed out",
+            ));
+        }
+    };
 
     let (response, websocket) = hyper_tungstenite::upgrade(&mut req, None)?;
     tokio::spawn(async move {
@@ -182,24 +247,24 @@ async fn ws_upgrade_h2(
 ) -> Result<Response<ResBody>, BoxError> {
     // Dial the upstream WebSocket first, same as the h1 path, so a dead upstream
     // is a 502 rather than an accepted-then-dropped tunnel.
-    let upstream_ws =
-        match tokio::time::timeout(connect_timeout, connect_async(&upstream_url)).await {
-            Ok(Ok((ws, _))) => ws,
-            Ok(Err(e)) => {
-                debug!(error = %e, upstream = %upstream_url, "upstream ws connect failed");
-                return Ok(text_response(
-                    StatusCode::BAD_GATEWAY,
-                    format!("upstream ws connect failed: {e}"),
-                ));
-            }
-            Err(_) => {
-                debug!(upstream = %upstream_url, "upstream ws connect timed out");
-                return Ok(text_response(
-                    StatusCode::BAD_GATEWAY,
-                    "upstream ws connect timed out",
-                ));
-            }
-        };
+    let ws_req = build_ws_request(&req, &upstream_url)?;
+    let upstream_ws = match tokio::time::timeout(connect_timeout, connect_async(ws_req)).await {
+        Ok(Ok((ws, _))) => ws,
+        Ok(Err(e)) => {
+            debug!(error = %e, upstream = %upstream_url, "upstream ws connect failed");
+            return Ok(text_response(
+                StatusCode::BAD_GATEWAY,
+                format!("upstream ws connect failed: {e}"),
+            ));
+        }
+        Err(_) => {
+            debug!(upstream = %upstream_url, "upstream ws connect timed out");
+            return Ok(text_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream ws connect timed out",
+            ));
+        }
+    };
 
     let on_upgrade = hyper::upgrade::on(req);
     tokio::spawn(async move {
