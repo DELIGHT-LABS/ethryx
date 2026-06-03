@@ -187,20 +187,63 @@ impl MockServer {
                             let method = req.method().clone();
                             let path = req.uri().path().to_owned();
                             let version = req.version();
-                            let body = req.into_body().collect().await.unwrap().to_bytes();
-                            let rr = RecordedRequest {
-                                method: method.clone(),
-                                path: path.clone(),
-                                version,
-                                body: body.clone(),
+                            let body_bytes = req.into_body().collect().await.unwrap().to_bytes();
+
+                            let (status, resp_bytes) = if body_bytes.first() == Some(&b'[') {
+                                // JSON-RPC batch request
+                                if let Ok(Value::Array(req_arr)) =
+                                    serde_json::from_slice::<Value>(&body_bytes)
+                                {
+                                    let mut resp_arr = Vec::new();
+                                    let mut overall_status = StatusCode::OK;
+                                    for req_item in req_arr {
+                                        let item_bytes = serde_json::to_vec(&req_item).unwrap();
+                                        let rr = RecordedRequest {
+                                            method: method.clone(),
+                                            path: path.clone(),
+                                            version,
+                                            body: Bytes::from(item_bytes),
+                                        };
+                                        rec.lock().unwrap().push(rr.clone());
+                                        let (status, item_resp_bytes) = h(&rr);
+                                        if !status.is_success() {
+                                            overall_status = status;
+                                        }
+                                        let req_id = req_item.get("id").cloned();
+                                        let mut item_resp_val: Value =
+                                            serde_json::from_slice(&item_resp_bytes)
+                                                .unwrap_or(Value::Null);
+                                        if let (Some(id_val), Some(obj)) =
+                                            (req_id, item_resp_val.as_object_mut())
+                                        {
+                                            obj.insert("id".to_string(), id_val);
+                                        }
+                                        resp_arr.push(item_resp_val);
+                                    }
+                                    let final_resp =
+                                        serde_json::to_vec(&Value::Array(resp_arr)).unwrap();
+                                    (overall_status, final_resp)
+                                } else {
+                                    (StatusCode::BAD_REQUEST, b"[]".to_vec())
+                                }
+                            } else {
+                                // Single request
+                                let rr = RecordedRequest {
+                                    method: method.clone(),
+                                    path: path.clone(),
+                                    version,
+                                    body: body_bytes.clone(),
+                                };
+                                rec.lock().unwrap().push(rr.clone());
+                                let (status, resp_bytes) = h(&rr);
+                                (status, resp_bytes)
                             };
-                            rec.lock().unwrap().push(rr.clone());
-                            let (status, body) = h(&rr);
+
                             Ok::<_, Infallible>(
                                 Response::builder()
                                     .status(status)
                                     .header("content-type", "application/json")
-                                    .body(Full::new(Bytes::from(body)))
+                                    .body(Full::new(Bytes::from(resp_bytes)))
                                     .unwrap(),
                             )
                         }
