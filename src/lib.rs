@@ -101,11 +101,19 @@ where
         listeners.push(listener);
     }
 
+    let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<()>(1);
+
     let mut accept_handles = Vec::with_capacity(listeners.len());
     for listener in listeners {
         let state = state.clone();
         let shutdown_tx = shutdown_tx.clone();
-        accept_handles.push(tokio::spawn(accept_loop(listener, state, shutdown_tx)));
+        let conn_tx = conn_tx.clone();
+        accept_handles.push(tokio::spawn(accept_loop(
+            listener,
+            state,
+            shutdown_tx,
+            conn_tx,
+        )));
     }
 
     shutdown.await;
@@ -118,11 +126,19 @@ where
     }
     let _ = poller.await;
 
+    // Drop primary sender so receiver returns None when all client connection senders drop
+    drop(conn_tx);
+
     info!(
         grace_secs = shutdown_grace.as_secs(),
         "draining connections"
     );
-    tokio::time::sleep(shutdown_grace).await;
+    if !shutdown_grace.is_zero() {
+        let _ = tokio::time::timeout(shutdown_grace, async move {
+            let _ = conn_rx.recv().await;
+        })
+        .await;
+    }
     Ok(())
 }
 
@@ -136,6 +152,7 @@ async fn accept_loop(
     listener: TcpListener,
     state: Arc<AppState>,
     shutdown_tx: watch::Sender<bool>,
+    conn_tx: tokio::sync::mpsc::Sender<()>,
 ) {
     let mut rx = shutdown_tx.subscribe();
     loop {
@@ -183,7 +200,9 @@ async fn accept_loop(
                     proxy::dispatch(req, st.clone())
                 });
                 let mut conn_rx = shutdown_tx.subscribe();
+                let conn_tx = conn_tx.clone();
                 tokio::spawn(async move {
+                    let _conn_tx = conn_tx;
                     // Auto-detect HTTP/1 vs HTTP/2 (incl. cleartext h2c preface);
                     // `_with_upgrades` keeps HTTP/1.1 WebSocket Upgrade working;
                     // `enable_connect_protocol` advertises RFC 8441 Extended CONNECT
