@@ -1271,3 +1271,119 @@ async fn el_upstream_h2c_timeout_falls_back_to_h1() {
 
     ethryx.shutdown().await;
 }
+
+/// WebSocket upstream that verifies specific request properties (path, query, headers)
+/// during handshake and then echoes.
+async fn ws_verifying_upstream(
+    expected_path: &'static str,
+    expected_headers: Vec<(String, String)>,
+    tx_verified: oneshot::Sender<bool>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        // We only expect one connection in this test.
+        if let Ok((stream, _)) = listener.accept().await {
+            let expected_headers = expected_headers.clone();
+            let verified = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let verified_cb = Arc::clone(&verified);
+
+            let ws_result = tokio_tungstenite::accept_hdr_async(
+                stream,
+                #[allow(clippy::result_large_err)]
+                move |req: &tokio_tungstenite::tungstenite::handshake::server::Request, resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    let actual_path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+                    if actual_path != expected_path {
+                        verified_cb.store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    for (k, v) in &expected_headers {
+                        if req.headers().get(k).and_then(|val| val.to_str().ok()) != Some(v) {
+                            verified_cb.store(false, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    Ok(resp)
+                },
+            )
+            .await;
+
+            let _ = tx_verified.send(verified.load(std::sync::atomic::Ordering::SeqCst));
+
+            if let Ok(ws) = ws_result {
+                let (mut tx, mut rx) = ws.split();
+                while let Some(Ok(msg)) = rx.next().await {
+                    if (msg.is_text() || msg.is_binary()) && tx.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    format!("ws://{addr}")
+}
+
+#[tokio::test]
+async fn ws_forwarding_preserves_path_query_and_headers() {
+    // Tests that WebSocket proxy relays custom headers (like authorization)
+    // and path/queries from client request to the upstream WebSocket correctly.
+    let el = MockServer::start(ok_handler()).await;
+    let cl = MockServer::start(ok_handler()).await;
+
+    let (tx_verified, rx_verified) = oneshot::channel::<bool>();
+
+    let ws_upstream = ws_verifying_upstream(
+        "/foo/bar?baz=qux",
+        vec![
+            (
+                "authorization".to_string(),
+                "Bearer secret-token".to_string(),
+            ),
+            ("x-custom-header".to_string(), "hello-world".to_string()),
+        ],
+        tx_verified,
+    )
+    .await;
+
+    let ethryx = EthryxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl.url,
+        "--el-ws-url",
+        &ws_upstream,
+    ])
+    .await;
+
+    // Connect using tungstenite Request with custom path/query and headers.
+    let target_url = format!("ws://127.0.0.1:{}/foo/bar?baz=qux", ethryx.port);
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = target_url.into_client_request().unwrap();
+    req.headers_mut().insert(
+        "authorization",
+        http::HeaderValue::from_static("Bearer secret-token"),
+    );
+    req.headers_mut().insert(
+        "x-custom-header",
+        http::HeaderValue::from_static("hello-world"),
+    );
+
+    let (mut ws, _resp) = connect_async(req).await.expect("handshake should succeed");
+
+    // Send a message and wait for it to be echoed to ensure connection works
+    ws.send(Message::Text("ping".into())).await.unwrap();
+    let echoed = loop {
+        match ws.next().await.expect("a reply").expect("ok frame") {
+            Message::Text(t) => break t,
+            _ => continue,
+        }
+    };
+    assert_eq!(echoed.as_str(), "ping");
+
+    // Check verification result
+    let is_verified = rx_verified.await.unwrap_or(false);
+    assert!(
+        is_verified,
+        "Upstream did not receive the expected path, query, or headers"
+    );
+
+    ethryx.shutdown().await;
+}
