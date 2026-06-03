@@ -246,9 +246,9 @@ pub(crate) async fn probe_once(state: &AppState) -> Probe {
     let batch = el_batch_detect(state).await;
     let (cl_status, cl_peers) = tokio::join!(cl_syncing_status(state), cl_peer_count(state));
     Probe {
-        el_syncing: batch.syncing,
-        el_peers: batch.peers,
-        el_block: batch.block,
+        el_syncing: batch.syncing.map_err(|e| e.to_string()),
+        el_peers: batch.peers.map_err(|e| e.to_string()),
+        el_block: batch.block.map_err(|e| e.to_string()),
         cl_status,
         cl_peers,
     }
@@ -263,10 +263,31 @@ fn el_client(state: &AppState) -> &ProxyClient {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HealthError {
+    Timeout,
+    Transport(String),
+    HttpStatus(http::StatusCode),
+    Decode(String),
+    Rpc(String),
+}
+
+impl std::fmt::Display for HealthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => write!(f, "timeout"),
+            Self::Transport(s) => write!(f, "transport: {s}"),
+            Self::HttpStatus(status) => write!(f, "http {status}"),
+            Self::Decode(s) => write!(f, "decode: {s}"),
+            Self::Rpc(s) => write!(f, "rpc error: {s}"),
+        }
+    }
+}
+
 struct ElBatchResult {
-    syncing: Result<Value, String>,
-    peers: Result<Value, String>,
-    block: Result<Value, String>,
+    syncing: Result<Value, HealthError>,
+    peers: Result<Value, HealthError>,
+    block: Result<Value, HealthError>,
 }
 
 /// Query all three EL JSON-RPC methods in a batch request, maintaining the transport verdict.
@@ -334,8 +355,8 @@ async fn el_batch_detect(state: &AppState) -> ElBatchResult {
 /// upstream. A timeout is included so that if the upstream hangs on the HTTP/2
 /// connection preface, we can fall back to HTTP/1.1 if the alternate client succeeds.
 /// If both timeout, we do not switch.
-fn is_transport(e: &str) -> bool {
-    e.starts_with("transport:") || e == "timeout"
+fn is_transport(e: &HealthError) -> bool {
+    matches!(e, HealthError::Transport(_) | HealthError::Timeout)
 }
 
 /// Refresh the shared [`Probe`] until shutdown: poll, then sleep `interval`,
@@ -625,13 +646,13 @@ async fn fetch_bytes(
     state: &AppState,
     req: Request<ResBody>,
     client: &ProxyClient,
-) -> Result<Bytes, String> {
+) -> Result<Bytes, HealthError> {
     let resp = tokio::time::timeout(state.cfg.health_timeout, client.request(req))
         .await
-        .map_err(|_| "timeout".to_string())?
-        .map_err(|e| format!("transport: {e}"))?;
+        .map_err(|_| HealthError::Timeout)?
+        .map_err(|e| HealthError::Transport(e.to_string()))?;
     if !resp.status().is_success() {
-        return Err(format!("http {}", resp.status()));
+        return Err(HealthError::HttpStatus(resp.status()));
     }
     let body = resp.into_body();
     let limited = http_body_util::Limited::new(body, 10 * 1024 * 1024);
@@ -639,43 +660,50 @@ async fn fetch_bytes(
         .collect()
         .await
         .map(|c| c.to_bytes())
-        .map_err(|e| format!("read: {e}"))
+        .map_err(|e| HealthError::Decode(e.to_string()))
 }
 
 async fn el_batch_rpc(
     state: &AppState,
     payload: Bytes,
     client: &ProxyClient,
-) -> Result<ElBatchResult, String> {
+) -> Result<ElBatchResult, HealthError> {
     let req = Request::builder()
         .method(Method::POST)
         .uri(state.el_http_uri.clone())
         .header("content-type", "application/json")
         .body(box_full(Full::new(payload)))
-        .map_err(|e| format!("build: {e}"))?;
+        .map_err(|e| HealthError::Transport(format!("build: {e}")))?;
     let body = fetch_bytes(state, req, client).await?;
-    let v: Value = serde_json::from_slice(&body).map_err(|e| format!("decode: {e}"))?;
+    let v: Value = serde_json::from_slice(&body).map_err(|e| HealthError::Decode(e.to_string()))?;
 
     let mut arr = match v {
         Value::Array(arr) => arr,
-        _ => return Err("expected JSON array response".to_string()),
+        _ => {
+            return Err(HealthError::Decode(
+                "expected JSON array response".to_string(),
+            ));
+        }
     };
     if arr.len() != 3 {
-        return Err(format!("expected 3 responses, got {}", arr.len()));
+        return Err(HealthError::Decode(format!(
+            "expected 3 responses, got {}",
+            arr.len()
+        )));
     }
 
-    let mut parse_res = |id_val: i64| -> Result<Value, String> {
+    let mut parse_res = |id_val: i64| -> Result<Value, HealthError> {
         let idx = arr
             .iter()
             .position(|res| res.get("id").and_then(Value::as_i64) == Some(id_val))
-            .ok_or_else(|| format!("missing response for id {id_val}"))?;
+            .ok_or_else(|| HealthError::Decode(format!("missing response for id {id_val}")))?;
         let mut resp = arr.remove(idx);
         if let Some(err) = resp.get_mut("error").map(|v| v.take()) {
-            return Err(format!("rpc error: {err}"));
+            return Err(HealthError::Rpc(err.to_string()));
         }
         resp.get_mut("result")
             .map(|v| v.take())
-            .ok_or_else(|| "missing result".into())
+            .ok_or_else(|| HealthError::Decode("missing result".into()))
     };
 
     Ok(ElBatchResult {
@@ -714,7 +742,9 @@ async fn cl_get_json(state: &AppState, uri: &Uri) -> Result<Value, String> {
         .uri(uri.clone())
         .body(box_full(Full::new(Bytes::new())))
         .map_err(|e| format!("build: {e}"))?;
-    let body = fetch_bytes(state, req, &state.client).await?;
+    let body = fetch_bytes(state, req, &state.client)
+        .await
+        .map_err(|e| e.to_string())?;
     serde_json::from_slice(&body).map_err(|e| format!("decode: {e}"))
 }
 

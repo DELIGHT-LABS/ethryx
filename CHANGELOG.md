@@ -22,12 +22,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   application log so `info` stays quiet by default, and health-probe paths
   (`/livez`, `/readyz`, `/healthz`) are excluded so frequent k8s / LB checks don't
   bury real traffic.
+- **WebSocket path/query & header forwarding**: The WebSocket proxy now preserves client paths, query strings, and custom headers (such as `Authorization` tokens) during the handshake to the upstream WS server.
+- **HTTP/1.1 fallback on h2c connection preface timeout**: Added automatic fallback to HTTP/1.1 if the execution layer upstream hangs on the cleartext h2c preface instead of closing the connection.
+- **Graceful connection draining**: Shutdown logic now tracks active client connections and gracefully drains them up to the `--shutdown-grace` period before exiting.
+- **Response body size limit**: Capped execution layer HTTP health poll responses at 10 MB to prevent memory exhaustion from unexpected large payloads.
 
 ### Changed
 
 - `info` logging stays reserved for lifecycle and state-change events; per-request
   proxy / WS outcomes and connection errors are `debug`, and connection accept /
   close are `trace`. A healthy sidecar is near-silent at `info` between changes.
+- **JSON-RPC batching for EL health queries**: Consolidated `eth_syncing`, `net_peerCount`, and `eth_getBlockByNumber` queries into a single batch request to reduce upstream request overhead.
+- **Zero-clone JSON extraction**: Used `Value::take()` and `Vec::remove()` in health poll batch parsing to eliminate deep copies of JSON Value structures.
+- **Zero-allocation connection logging**: Replaced `Arc<AtomicBool>` connection logging flag with a stack-captured `AtomicBool` directly inside the connection loop to avoid heap allocations per connection.
+- **Header copying optimization**: Replaced loop-based header insertion with direct `HeaderMap::clone()` to utilize optimized vectorized block allocations.
+- **Type-safe health check errors**: Replaced string-based error matching in health checking flow control with a structured `HealthError` enum.
 
 ## [0.1.2] - 2026-05-31
 

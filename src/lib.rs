@@ -185,7 +185,7 @@ async fn accept_loop(
                 // request's version is that choice, so log one access line on the
                 // first dispatch — skipping health-probe paths so frequent k8s/LB
                 // checks don't drown the access log.
-                let logged = Arc::new(AtomicBool::new(false));
+                let logged = AtomicBool::new(false);
                 let svc = service_fn(move |req: Request<Incoming>| {
                     if !logged.swap(true, Ordering::Relaxed) && !is_probe_path(req.uri().path()) {
                         info!(
