@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+## [0.1.3] - 2026-06-03
+
 ### Added
 
 - The boot log line now includes the ethryx `version` (e.g. `v0.1.2`) and a `git`
