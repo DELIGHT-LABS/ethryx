@@ -309,13 +309,13 @@ async fn el_syncing_detect(state: &AppState) -> Result<Value, String> {
     alt
 }
 
-/// A hard transport/connection failure (vs. a timeout, HTTP status, or decode
-/// error) — the only signal that the chosen HTTP version is wrong for this
-/// upstream. A timeout is deliberately excluded: it's ambiguous (a slow upstream),
-/// and because the verdict is sticky, letting a transient timeout trigger a switch
-/// would strand us on the wrong protocol until restart.
+/// A hard transport/connection failure or a timeout (vs. an HTTP status or decode
+/// error) — the only signal that the chosen HTTP version might be wrong for this
+/// upstream. A timeout is included so that if the upstream hangs on the HTTP/2
+/// connection preface, we can fall back to HTTP/1.1 if the alternate client succeeds.
+/// If both timeout, we do not switch.
 fn is_transport(e: &str) -> bool {
-    e.starts_with("transport:")
+    e.starts_with("transport:") || e == "timeout"
 }
 
 /// Refresh the shared [`Probe`] until shutdown: poll, then sleep `interval`,

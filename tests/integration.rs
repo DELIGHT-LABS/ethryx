@@ -136,15 +136,20 @@ struct MockServer {
 impl MockServer {
     /// Serve HTTP/1.1 only (rejects an h2c prior-knowledge preface).
     async fn start(handler: MockHandler) -> Self {
-        Self::serve(handler, false).await
+        Self::serve(handler, false, false).await
     }
 
     /// Serve both HTTP/1.1 and cleartext HTTP/2 (h2c), like geth >=v1.17 / erigon.
     async fn start_h2c(handler: MockHandler) -> Self {
-        Self::serve(handler, true).await
+        Self::serve(handler, true, false).await
     }
 
-    async fn serve(handler: MockHandler, h2: bool) -> Self {
+    /// Serve HTTP/1.1 only, but hang if an h2c prior-knowledge preface (PRI) is received.
+    async fn start_hanging_h2c(handler: MockHandler) -> Self {
+        Self::serve(handler, false, true).await
+    }
+
+    async fn serve(handler: MockHandler, h2: bool, hang_h2c: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
         let url = format!("http://{addr}");
@@ -160,6 +165,20 @@ impl MockServer {
                 let h = h.clone();
                 let rec = rec.clone();
                 tokio::spawn(async move {
+                    if hang_h2c {
+                        // Peek first 3 bytes to see if it starts with HTTP/2 preface "PRI"
+                        let mut buf = [0u8; 3];
+                        if stream
+                            .peek(&mut buf)
+                            .await
+                            .is_ok_and(|n| n >= 3 && &buf == b"PRI")
+                        {
+                            // It's the HTTP/2 preface! Hang for 1.5 seconds to cause a timeout.
+                            tokio::time::sleep(Duration::from_millis(1500)).await;
+                            return;
+                        }
+                    }
+
                     let io = TokioIo::new(stream);
                     let svc = service_fn(move |req: Request<Incoming>| {
                         let h = h.clone();
@@ -1154,6 +1173,58 @@ async fn http2_extended_connect_ws_bridges_to_upstream() {
         }
     };
     assert_eq!(echoed.as_str(), "ping");
+
+    ethryx.shutdown().await;
+}
+
+#[tokio::test]
+async fn el_upstream_h2c_timeout_falls_back_to_h1() {
+    // If the EL upstream hangs on h2c connection preface (causing a timeout)
+    // rather than closing it, ethryx should fallback to HTTP/1.1 if HTTP/1.1 works.
+    let el = MockServer::start_hanging_h2c(Arc::new(|req| {
+        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+        let result = match method {
+            "eth_syncing" => json!(false),
+            "net_peerCount" => json!("0x0"),
+            "eth_getBlockByNumber" => json!({"number": "0x1", "timestamp": "0x1"}),
+            _ => json!(null),
+        };
+        let resp = json!({"jsonrpc": "2.0", "id": 1, "result": result});
+        (StatusCode::OK, serde_json::to_vec(&resp).unwrap())
+    }))
+    .await;
+
+    let cl = MockServer::start(Arc::new(|req| match req.path.as_str() {
+        "/eth/v1/node/syncing" => (
+            StatusCode::OK,
+            serde_json::to_vec(&json!({
+                "data": {"head_slot": "1", "sync_distance": "0", "is_syncing": false}
+            }))
+            .unwrap(),
+        ),
+        "/eth/v1/node/peer_count" => (
+            StatusCode::OK,
+            serde_json::to_vec(&json!({"data": {"connected": "0"}})).unwrap(),
+        ),
+        _ => (StatusCode::NOT_FOUND, b"{}".to_vec()),
+    }))
+    .await;
+
+    // Start ethryx. By default, it warms up cache on start.
+    // If fallback works, starting will succeed because the warm-up succeeds.
+    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+
+    let c = client();
+    let (status, body) = get(&c, &ethryx.url("/readyz")).await;
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, StatusCode::OK, "expected ready, got {status}: {v}");
+    assert_eq!(v["status"], "ready");
+
+    // Let's also check /healthz report
+    let (_, hz) = get(&c, &ethryx.url("/healthz")).await;
+    let hv: Value = serde_json::from_slice(&hz).unwrap();
+    assert_eq!(hv["el"]["transport"], "http/1.1"); // verified fallback to HTTP/1.1!
 
     ethryx.shutdown().await;
 }
