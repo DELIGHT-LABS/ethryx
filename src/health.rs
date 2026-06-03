@@ -633,7 +633,9 @@ async fn fetch_bytes(
     if !resp.status().is_success() {
         return Err(format!("http {}", resp.status()));
     }
-    resp.into_body()
+    let body = resp.into_body();
+    let limited = http_body_util::Limited::new(body, 10 * 1024 * 1024);
+    limited
         .collect()
         .await
         .map(|c| c.to_bytes())
