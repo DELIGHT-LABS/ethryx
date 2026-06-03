@@ -123,10 +123,7 @@ impl Probe {
     }
 }
 
-const SYNCING_REQ: &[u8] = br#"{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}"#;
-const PEERS_REQ: &[u8] = br#"{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":1}"#;
-const BLOCK_REQ: &[u8] =
-    br#"{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["latest",false],"id":1}"#;
+const EL_BATCH_REQ: &[u8] = br#"[{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1},{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":2},{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["latest",false],"id":3}]"#;
 
 /// `/healthz` — verdict-free EL + CL snapshot, **always 200**. Serves the latest
 /// background poll (see [`poll_loop`]); block / slot ages are recomputed live per
@@ -245,21 +242,13 @@ fn readiness_transition(prev_ready: Option<bool>, ready: bool) -> Transition {
 /// Query all five upstream signals once. Each call is bounded by
 /// `--health-timeout`; failures land in the result rather than aborting.
 pub(crate) async fn probe_once(state: &AppState) -> Probe {
-    // eth_syncing runs first and doubles as EL transport detection: it tries the
-    // preferred client and, on a transport failure, the other — flipping
-    // `el_use_h2` so the rest of this cycle and the data-plane follow.
-    let el_syncing = el_syncing_detect(state).await;
-    let el = el_client(state);
-    let (el_peers, el_block, cl_status, cl_peers) = tokio::join!(
-        el_rpc(state, Bytes::from_static(PEERS_REQ), el),
-        el_rpc(state, Bytes::from_static(BLOCK_REQ), el),
-        cl_syncing_status(state),
-        cl_peer_count(state),
-    );
+    // Probe EL in a single batch request, which also performs transport detection.
+    let batch = el_batch_detect(state).await;
+    let (cl_status, cl_peers) = tokio::join!(cl_syncing_status(state), cl_peer_count(state));
     Probe {
-        el_syncing,
-        el_peers,
-        el_block,
+        el_syncing: batch.syncing,
+        el_peers: batch.peers,
+        el_block: batch.block,
         cl_status,
         cl_peers,
     }
@@ -274,39 +263,70 @@ fn el_client(state: &AppState) -> &ProxyClient {
     }
 }
 
-/// `eth_syncing` probe that also maintains the EL transport verdict. It sends over
-/// the preferred client; on a transport-layer failure it retries over the other
-/// and — only if that succeeds — flips `el_use_h2`. So an h2c↔h1 change is picked
-/// up within one poll, while a dead upstream (both fail) leaves the verdict as is.
-async fn el_syncing_detect(state: &AppState) -> Result<Value, String> {
+struct ElBatchResult {
+    syncing: Result<Value, String>,
+    peers: Result<Value, String>,
+    block: Result<Value, String>,
+}
+
+/// Query all three EL JSON-RPC methods in a batch request, maintaining the transport verdict.
+async fn el_batch_detect(state: &AppState) -> ElBatchResult {
     let prefer_h2 = state.el_use_h2.load(Ordering::Relaxed);
-    let payload = Bytes::from_static(SYNCING_REQ);
-    let primary = el_rpc(state, payload.clone(), el_client(state)).await;
-    if !matches!(&primary, Err(e) if is_transport(e)) {
-        // The preferred transport reached the upstream (Ok, or an HTTP/decode
-        // error — both mean the connection itself worked); keep the verdict.
-        return primary;
+    let payload = Bytes::from_static(EL_BATCH_REQ);
+    let primary = el_batch_rpc(state, payload.clone(), el_client(state)).await;
+
+    match primary {
+        Ok(res) => res,
+        Err(e) if is_transport(&e) => {
+            // The preferred transport failed at the connection level — try the other one.
+            let other = if prefer_h2 {
+                &state.client
+            } else {
+                &state.el_h2_client
+            };
+            let alt = el_batch_rpc(state, payload, other).await;
+            match alt {
+                Ok(res) => {
+                    state.el_use_h2.store(!prefer_h2, Ordering::Relaxed);
+                    if prefer_h2 {
+                        warn!("EL JSON-RPC upstream stopped speaking h2c — using HTTP/1.1");
+                    } else {
+                        info!("EL JSON-RPC upstream speaks h2c — using HTTP/2");
+                    }
+                    res
+                }
+                Err(alt_err) => {
+                    if is_transport(&alt_err) {
+                        // Both transports failed at the connection level → upstream down.
+                        // Keep current verdict and report original error.
+                        ElBatchResult {
+                            syncing: Err(e.clone()),
+                            peers: Err(e.clone()),
+                            block: Err(e),
+                        }
+                    } else {
+                        // Alternative transport reached upstream (non-transport error, e.g. 404) → switch.
+                        state.el_use_h2.store(!prefer_h2, Ordering::Relaxed);
+                        if prefer_h2 {
+                            warn!("EL JSON-RPC upstream stopped speaking h2c — using HTTP/1.1");
+                        } else {
+                            info!("EL JSON-RPC upstream speaks h2c — using HTTP/2");
+                        }
+                        ElBatchResult {
+                            syncing: Err(alt_err.clone()),
+                            peers: Err(alt_err.clone()),
+                            block: Err(alt_err),
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => ElBatchResult {
+            syncing: Err(e.clone()),
+            peers: Err(e.clone()),
+            block: Err(e),
+        },
     }
-    // The preferred transport failed at the connection level — try the other one.
-    // If *it* reaches the upstream, the upstream changed protocols, so switch. If
-    // it too fails at the transport level the upstream is simply down, so keep the
-    // verdict and report the original error.
-    let other = if prefer_h2 {
-        &state.client
-    } else {
-        &state.el_h2_client
-    };
-    let alt = el_rpc(state, payload, other).await;
-    if matches!(&alt, Err(e) if is_transport(e)) {
-        return primary; // both transports failed → upstream down
-    }
-    state.el_use_h2.store(!prefer_h2, Ordering::Relaxed);
-    if prefer_h2 {
-        warn!("EL JSON-RPC upstream stopped speaking h2c — using HTTP/1.1");
-    } else {
-        info!("EL JSON-RPC upstream speaks h2c — using HTTP/2");
-    }
-    alt
 }
 
 /// A hard transport/connection failure or a timeout (vs. an HTTP status or decode
@@ -620,7 +640,11 @@ async fn fetch_bytes(
         .map_err(|e| format!("read: {e}"))
 }
 
-async fn el_rpc(state: &AppState, payload: Bytes, client: &ProxyClient) -> Result<Value, String> {
+async fn el_batch_rpc(
+    state: &AppState,
+    payload: Bytes,
+    client: &ProxyClient,
+) -> Result<ElBatchResult, String> {
     let req = Request::builder()
         .method(Method::POST)
         .uri(state.el_http_uri.clone())
@@ -629,12 +653,34 @@ async fn el_rpc(state: &AppState, payload: Bytes, client: &ProxyClient) -> Resul
         .map_err(|e| format!("build: {e}"))?;
     let body = fetch_bytes(state, req, client).await?;
     let v: Value = serde_json::from_slice(&body).map_err(|e| format!("decode: {e}"))?;
-    if let Some(err) = v.get("error") {
-        return Err(format!("rpc error: {err}"));
+
+    let mut arr = match v {
+        Value::Array(arr) => arr,
+        _ => return Err("expected JSON array response".to_string()),
+    };
+    if arr.len() != 3 {
+        return Err(format!("expected 3 responses, got {}", arr.len()));
     }
-    v.get("result")
-        .cloned()
-        .ok_or_else(|| "missing result".into())
+
+    let mut parse_res = |id_val: i64| -> Result<Value, String> {
+        let idx = arr
+            .iter()
+            .position(|res| res.get("id").and_then(Value::as_i64) == Some(id_val))
+            .ok_or_else(|| format!("missing response for id {id_val}"))?;
+        let mut resp = arr.remove(idx);
+        if let Some(err) = resp.get_mut("error").map(|v| v.take()) {
+            return Err(format!("rpc error: {err}"));
+        }
+        resp.get_mut("result")
+            .map(|v| v.take())
+            .ok_or_else(|| "missing result".into())
+    };
+
+    Ok(ElBatchResult {
+        syncing: parse_res(1),
+        peers: parse_res(2),
+        block: parse_res(3),
+    })
 }
 
 async fn cl_syncing_status(state: &AppState) -> Result<ClStatus, String> {
