@@ -15,7 +15,7 @@ health for an Ethereum **Execution Layer** (EL) and **Consensus Layer** (CL) pai
 | `GET /livez`                         | 200 OK (process liveness) |
 | `GET /readyz`                        | EL + CL readiness gate (200 / 503) |
 | `GET /healthz`                       | EL + CL state snapshot (always 200) |
-| `/eth/...` (Beacon API)              | `--cl-beacon-url`   |
+| `/eth/...`, `/lighthouse/...`, `/prysm/...`, `/teku/...`, `/lodestar/...`, `/nimbus/...` | `--cl-beacon-url`   |
 | `Upgrade: websocket`                 | `--el-ws-url`       |
 | everything else (JSON-RPC `POST /`)  | `--el-http-url`     |
 
