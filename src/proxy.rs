@@ -57,7 +57,7 @@ pub async fn dispatch(
     }))
 }
 
-fn is_cl_path(path: &str) -> bool {
+pub(crate) fn is_cl_path(path: &str) -> bool {
     let bytes = path.as_bytes();
     if bytes.first() != Some(&b'/') {
         return false;
@@ -341,6 +341,26 @@ async fn bridge_ws<C, U>(
     }
 }
 
+pub(crate) fn classify_request<B>(req: &Request<B>) -> (&'static str, &'static str) {
+    let upstream_type = if is_cl_path(req.uri().path()) {
+        "CL"
+    } else {
+        "EL"
+    };
+    let upstream_proto = if req.method() == Method::CONNECT
+        && req
+            .extensions()
+            .get::<hyper::ext::Protocol>()
+            .is_some_and(|p| p.as_str() == "websocket")
+        || hyper_tungstenite::is_upgrade_request(req)
+    {
+        "WS"
+    } else {
+        "HTTP"
+    };
+    (upstream_type, upstream_proto)
+}
+
 pub fn box_incoming<B>(body: B) -> ResBody
 where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
@@ -401,5 +421,38 @@ mod tests {
         assert!(!is_cl_path("/lighthousestuff"));
         assert!(!is_cl_path("/prys"));
         assert!(!is_cl_path("eth"));
+    }
+
+    #[test]
+    fn test_classify_request() {
+        // 1. CL Path HTTP request
+        let req = Request::builder()
+            .uri("/eth/v1/node/syncing")
+            .body(())
+            .unwrap();
+        assert_eq!(classify_request(&req), ("CL", "HTTP"));
+
+        // 2. EL Path HTTP request
+        let req = Request::builder().uri("/").body(()).unwrap();
+        assert_eq!(classify_request(&req), ("EL", "HTTP"));
+
+        // 3. WS HTTP/1.1 Upgrade request
+        let req = Request::builder()
+            .uri("/")
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .body(())
+            .unwrap();
+        assert_eq!(classify_request(&req), ("EL", "WS"));
+
+        // 4. WS HTTP/2 Extended CONNECT request
+        let mut req = Request::builder()
+            .method(Method::CONNECT)
+            .uri("/")
+            .body(())
+            .unwrap();
+        req.extensions_mut()
+            .insert(hyper::ext::Protocol::from_static("websocket"));
+        assert_eq!(classify_request(&req), ("EL", "WS"));
     }
 }

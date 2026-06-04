@@ -86,7 +86,21 @@ where
     // Warm the health cache with one poll before serving, then refresh it in the
     // background so /healthz and /readyz read a snapshot instead of hitting
     // upstream on every probe.
-    let _ = probe_tx.send(Arc::new(health::probe_once(&state).await));
+    let first_probe = Arc::new(health::probe_once(&state).await);
+    let el_proto = if state.el_use_h2.load(Ordering::Relaxed) {
+        "HTTP/2 (h2c)"
+    } else {
+        "HTTP/1.1"
+    };
+    info!(
+        el_http = %state.cfg.el_http_url,
+        el_http_proto = %el_proto,
+        el_ws = %state.cfg.el_ws_url,
+        cl_beacon = %state.cfg.cl_beacon_url,
+        cl_proto = "HTTP/1.1",
+        "upstreams connected"
+    );
+    let _ = probe_tx.send(first_probe);
     let poller = tokio::spawn(health::poll_loop(
         state.clone(),
         probe_tx,
@@ -188,12 +202,15 @@ async fn accept_loop(
                 let logged = AtomicBool::new(false);
                 let svc = service_fn(move |req: Request<Incoming>| {
                     if !logged.swap(true, Ordering::Relaxed) && !is_probe_path(req.uri().path()) {
+                        let (upstream_type, upstream_proto) = crate::proxy::classify_request(&req);
                         info!(
                             target: "access_log",
                             %peer,
                             version = ?req.version(),
                             method = %req.method(),
                             path = req.uri().path(),
+                            upstream = upstream_type,
+                            proto = upstream_proto,
                             "connection",
                         );
                     }
