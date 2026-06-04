@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+### Added
+
+- **Route client-specific consensus API paths to CL upstream**: Added path matching to forward client-specific consensus API paths (e.g. `/lighthouse/...`, `/prysm/...`, `/teku/...`, `/lodestar/...`, `/nimbus/...`) to the Consensus Layer (CL) upstream instead of the Execution Layer.
+- **Enriched connection access logs**: Added `upstream` (EL/CL) and `proto` (HTTP/WS) fields to connection access logs (`target: "access_log"`).
+- **Startup upstream protocol logging**: Logs configured upstream URLs and their resolved/negotiated protocols (e.g. `HTTP/2 (h2c)` vs `HTTP/1.1`) at `info` level once startup health check completes.
+
 ## [0.1.3] - 2026-06-03
 
 ### Added
