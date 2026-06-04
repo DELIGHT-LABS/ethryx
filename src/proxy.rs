@@ -57,6 +57,28 @@ pub async fn dispatch(
     }))
 }
 
+fn is_cl_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.first() != Some(&b'/') {
+        return false;
+    }
+    let remainder = &bytes[1..];
+    let len = remainder
+        .iter()
+        .position(|&b| b == b'/')
+        .unwrap_or(remainder.len());
+    let segment = &remainder[..len];
+    match segment.len() {
+        3 => segment == b"eth",
+        4 => segment == b"teku",
+        5 => segment == b"prysm",
+        6 => segment == b"nimbus",
+        8 => segment == b"lodestar",
+        10 => segment == b"lighthouse",
+        _ => false,
+    }
+}
+
 async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResBody>, BoxError> {
     trace!(method = %req.method(), path = req.uri().path(), "routing request");
     if req.method() == Method::GET {
@@ -71,7 +93,7 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
             return Ok(text_response(StatusCode::OK, Bytes::from_static(b"ok")));
         }
     }
-    if req.uri().path().starts_with("/eth/") {
+    if is_cl_path(req.uri().path()) {
         return http_proxy(req, state, &state.cfg.cl_beacon_url, &state.client).await;
     }
     // HTTP/2 Extended CONNECT WebSocket (RFC 8441): :method=CONNECT, :protocol=websocket.
@@ -337,4 +359,47 @@ pub fn text_response(code: StatusCode, msg: impl Into<Bytes>) -> Response<ResBod
         .header("content-type", "text/plain; charset=utf-8")
         .body(box_full(Full::new(msg.into())))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_cl_path() {
+        // Positive cases: Standard and client-specific CL prefixes
+        assert!(is_cl_path("/eth"));
+        assert!(is_cl_path("/eth/"));
+        assert!(is_cl_path("/eth/v1/node/syncing"));
+
+        assert!(is_cl_path("/teku"));
+        assert!(is_cl_path("/teku/"));
+        assert!(is_cl_path("/teku/v1/node/syncing"));
+
+        assert!(is_cl_path("/prysm"));
+        assert!(is_cl_path("/prysm/"));
+        assert!(is_cl_path("/prysm/v1/node/syncing"));
+
+        assert!(is_cl_path("/nimbus"));
+        assert!(is_cl_path("/nimbus/"));
+        assert!(is_cl_path("/nimbus/v1/node/syncing"));
+
+        assert!(is_cl_path("/lodestar"));
+        assert!(is_cl_path("/lodestar/"));
+        assert!(is_cl_path("/lodestar/v1/node/syncing"));
+
+        assert!(is_cl_path("/lighthouse"));
+        assert!(is_cl_path("/lighthouse/"));
+        assert!(is_cl_path("/lighthouse/v1/node/syncing"));
+
+        // Negative cases
+        assert!(!is_cl_path("/"));
+        assert!(!is_cl_path(""));
+        assert!(!is_cl_path("/healthz"));
+        assert!(!is_cl_path("/readyz"));
+        assert!(!is_cl_path("/livez"));
+        assert!(!is_cl_path("/lighthousestuff"));
+        assert!(!is_cl_path("/prys"));
+        assert!(!is_cl_path("eth"));
+    }
 }

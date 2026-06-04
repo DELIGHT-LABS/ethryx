@@ -545,6 +545,55 @@ async fn beacon_path_is_routed_to_cl_upstream() {
 }
 
 #[tokio::test]
+async fn client_specific_beacon_paths_are_routed_to_cl_upstream() {
+    let el = MockServer::start(Arc::new(|req| {
+        // Assert that none of the client-specific paths reach EL.
+        let path = &req.path;
+        assert!(
+            !(path.starts_with("/lighthouse")
+                || path.starts_with("/prysm")
+                || path.starts_with("/teku")
+                || path.starts_with("/lodestar")
+                || path.starts_with("/nimbus")),
+            "EL must not see client-specific beacon traffic, got {}",
+            path
+        );
+        (StatusCode::OK, b"{}".to_vec())
+    }))
+    .await;
+    let cl = MockServer::start(Arc::new(|req| {
+        assert_eq!(req.method, Method::GET);
+        let resp = format!(r#"{{"path":"{}"}}"#, req.path);
+        (StatusCode::OK, resp.into_bytes())
+    }))
+    .await;
+    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+
+    let c = client();
+    let paths = vec![
+        "/lighthouse/version",
+        "/prysm/v1/node/syncing",
+        "/teku/v1/node/syncing",
+        "/lodestar/v1/node/syncing",
+        "/nimbus/v1/node/syncing",
+        "/lighthouse",
+        "/prysm",
+        "/teku",
+        "/lodestar",
+        "/nimbus",
+    ];
+
+    for path in paths {
+        let (status, body) = get(&c, &ethryx.url(path)).await;
+        assert_eq!(status, StatusCode::OK, "Failed for path: {path}");
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["path"], path, "Failed for path: {path}");
+    }
+
+    ethryx.shutdown().await;
+}
+
+#[tokio::test]
 async fn hop_by_hop_headers_are_stripped_on_forward() {
     let el = MockServer::start(Arc::new(|req| {
         // Verify ethryx removed hop-by-hop headers when forwarding.
