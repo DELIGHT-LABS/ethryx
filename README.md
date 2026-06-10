@@ -238,6 +238,22 @@ The following metrics are exposed:
 - `ethryx_upstream_slot_number`: Latest consensus layer head slot number.
 - `ethryx_upstream_health_status`: Upstream health status (1 = healthy/synced, 0 = degraded/down, labeled by `layer`).
 
+## OpenTelemetry
+
+If built with the `otel` feature, ethryx supports exporting traces and metrics to an OTLP endpoint (HTTP protocol).
+
+```sh
+# Build with OpenTelemetry support
+cargo build --features otel
+
+# Run with OTLP endpoint
+ethryx --otel-endpoint http://localhost:4318 ...
+```
+
+When enabled:
+- **Distributed Tracing**: Context propagation is hooked into client requests (W3C standard `traceparent` headers are injected into upstream requests).
+- **Span Attributes**: Upstream requests are instrumented with tracing spans containing method, path, and upstream layer details.
+
 ## systemd
 
 ```ini

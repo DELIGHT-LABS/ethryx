@@ -146,6 +146,11 @@ pub struct Config {
     /// Shutdown grace period (seconds) for draining in-flight connections.
     #[arg(long, env = "ETHRYX_SHUTDOWN_GRACE", default_value = "10", value_parser = parse_secs)]
     pub shutdown_grace: Duration,
+
+    /// OpenTelemetry collector endpoint (HTTP) for exporting traces/metrics.
+    #[cfg(feature = "otel")]
+    #[arg(long, env = "ETHRYX_OTEL_ENDPOINT")]
+    pub otel_endpoint: Option<String>,
 }
 
 impl Config {
