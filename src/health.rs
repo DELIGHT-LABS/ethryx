@@ -377,6 +377,89 @@ fn is_transport(e: &HealthError) -> bool {
     matches!(e, HealthError::Transport(_) | HealthError::Timeout)
 }
 
+pub(crate) fn update_metrics(probe: &Probe, report: &ReadyReport) {
+    let metrics = crate::metrics::metrics();
+
+    // 1. Upstream Health Status (1 = healthy/synced, 0 = degraded/down)
+    metrics
+        .upstream_health_status
+        .with_label_values(&["el"])
+        .set(if report.el_syncing.ok { 1 } else { 0 });
+    metrics
+        .upstream_health_status
+        .with_label_values(&["cl"])
+        .set(if report.cl_syncing.ok { 1 } else { 0 });
+
+    // 2. EL peers
+    if let Ok(peers_hex) = &probe.el_peers {
+        if let Some(peers) = hex_to_u64(peers_hex) {
+            metrics
+                .upstream_peers
+                .with_label_values(&["el"])
+                .set(peers as i64);
+        }
+    } else {
+        metrics.upstream_peers.with_label_values(&["el"]).set(0);
+    }
+
+    // 3. CL peers
+    if let Ok(peers) = probe.cl_peers {
+        metrics
+            .upstream_peers
+            .with_label_values(&["cl"])
+            .set(peers as i64);
+    } else {
+        metrics.upstream_peers.with_label_values(&["cl"]).set(0);
+    }
+
+    // 4. EL sync distance
+    match &probe.el_syncing {
+        Ok(ElSyncingResult::Syncing {
+            current_block,
+            highest_block,
+        }) => {
+            let current = hex_to_u64(current_block);
+            let highest = hex_to_u64(highest_block);
+            if let (Some(c), Some(h)) = (current, highest) {
+                metrics
+                    .upstream_sync_distance
+                    .with_label_values(&["el"])
+                    .set(h.saturating_sub(c) as i64);
+            }
+        }
+        _ => {
+            metrics
+                .upstream_sync_distance
+                .with_label_values(&["el"])
+                .set(0);
+        }
+    }
+
+    // 5. CL sync distance
+    if let Ok(status) = &probe.cl_status {
+        metrics
+            .upstream_sync_distance
+            .with_label_values(&["cl"])
+            .set(status.sync_distance as i64);
+        metrics.upstream_slot_number.set(status.head_slot as i64);
+    } else {
+        metrics
+            .upstream_sync_distance
+            .with_label_values(&["cl"])
+            .set(0);
+    }
+
+    // 6. EL block number
+    if let Some(num) = probe
+        .el_block
+        .as_ref()
+        .ok()
+        .and_then(|block| hex_to_u64(&block.number))
+    {
+        metrics.upstream_block_number.set(num as i64);
+    }
+}
+
 /// Refresh the shared [`Probe`] until shutdown: poll, then sleep `interval`,
 /// repeat. The cache is warmed by one poll before this loop starts, so the first
 /// background refresh lands `interval` later. Sleeping *after* each poll gives a
@@ -408,6 +491,8 @@ pub(crate) async fn poll_loop(
         let report = evaluate_ready(&state, &probe);
         let ready = report.status == "ready";
         debug!(status = report.status, "health poll");
+
+        update_metrics(&probe, &report);
 
         match readiness_transition(prev_ready, ready) {
             Transition::Silent => {}

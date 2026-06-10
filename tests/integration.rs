@@ -1436,3 +1436,35 @@ async fn ws_forwarding_preserves_path_query_and_headers() {
 
     ethryx.shutdown().await;
 }
+
+#[tokio::test]
+async fn metrics_endpoint_returns_formatted_prometheus_metrics() {
+    let el = MockServer::start(ok_handler()).await;
+    let cl = MockServer::start(ok_handler()).await;
+    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+
+    let c = client();
+
+    // Fire a quick request to record some request count metrics
+    let (status, _) = post_json(
+        &c,
+        &ethryx.url("/"),
+        json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Fetch metrics
+    let (status, body) = get(&c, &ethryx.url("/metrics")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let metrics_str = String::from_utf8_lossy(&body);
+    // Assert some of the metrics exist in the response
+    assert!(metrics_str.contains("ethryx_proxy_requests_total"));
+    assert!(metrics_str.contains("ethryx_proxy_request_duration_seconds"));
+    assert!(metrics_str.contains("ethryx_active_connections"));
+    assert!(metrics_str.contains("ethryx_upstream_health_status"));
+    assert!(metrics_str.contains("ethryx_upstream_peers"));
+
+    ethryx.shutdown().await;
+}

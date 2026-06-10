@@ -15,6 +15,7 @@ health for an Ethereum **Execution Layer** (EL) and **Consensus Layer** (CL) pai
 | `GET /livez`                         | 200 OK (process liveness) |
 | `GET /readyz`                        | EL + CL readiness gate (200 / 503) |
 | `GET /healthz`                       | EL + CL state snapshot (always 200) |
+| `GET /metrics`                       | Prometheus metrics scrape endpoint |
 | `/eth/...`, `/lighthouse/...`, `/prysm/...`, `/teku/...`, `/lodestar/...`, `/nimbus/...` | `--cl-beacon-url`   |
 | `Upgrade: websocket`                 | `--el-ws-url`       |
 | everything else (JSON-RPC `POST /`)  | `--el-http-url`     |
@@ -28,6 +29,7 @@ Three endpoints, split by purpose (Kubernetes `z` convention):
 | `GET /livez`   | always `200`, body `ok`       | liveness probe (restart)    | nothing — only that the process is up; no upstream call |
 | `GET /readyz`  | `200` ready / `503` not ready | readiness probe (LB gate)   | EL + CL **sync status** (plus freshness with `--readyz-strict`) |
 | `GET /healthz` | always `200` + JSON snapshot  | monitoring / alerting / curl | nothing — reports state, never judges                 |
+| `GET /metrics` | Prometheus metrics text format | Prometheus scraper          | nothing — metrics scraper                             |
 
 `/livez` and `/readyz` differ exactly when the node is up but not serving yet
 (startup, mid-sync, or an upstream is down): `/livez` stays `200` (don't restart
@@ -221,6 +223,20 @@ directly. When `RUST_LOG` is set it takes over the whole filter (the
 ethryx --access-log ...
 RUST_LOG=ethryx=debug,access_log=info ethryx ...
 ```
+
+## Metrics
+
+ethryx exports core application and proxy metrics on `GET /metrics`.
+
+The following metrics are exposed:
+- `ethryx_active_connections`: Number of currently active client connections (labeled by `protocol` as `tcp` or `ws`).
+- `ethryx_proxy_requests_total`: Total number of proxied HTTP/WS requests (labeled by `upstream`, `method`, `status`).
+- `ethryx_proxy_request_duration_seconds`: Latency histogram of upstream proxied requests (labeled by `upstream`).
+- `ethryx_upstream_peers`: Number of peers reported by upstream nodes (labeled by `layer` as `el` or `cl`).
+- `ethryx_upstream_sync_distance`: Remaining sync distance in blocks or slots (labeled by `layer` as `el` or `cl`).
+- `ethryx_upstream_block_number`: Latest execution layer block number.
+- `ethryx_upstream_slot_number`: Latest consensus layer head slot number.
+- `ethryx_upstream_health_status`: Upstream health status (1 = healthy/synced, 0 = degraded/down, labeled by `layer`).
 
 ## systemd
 
