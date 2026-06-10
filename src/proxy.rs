@@ -91,6 +91,22 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
         if path == "/livez" {
             return Ok(text_response(StatusCode::OK, Bytes::from_static(b"ok")));
         }
+        if path == "/metrics" {
+            use prometheus::Encoder;
+            let encoder = prometheus::TextEncoder::new();
+            let metric_families = crate::metrics::metrics().registry.gather();
+            let mut buffer = Vec::new();
+            encoder.encode(&metric_families, &mut buffer).unwrap();
+
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", encoder.format_type())
+                .body(crate::proxy::box_full(http_body_util::Full::new(
+                    Bytes::from(buffer),
+                )))
+                .unwrap();
+            return Ok(response);
+        }
     }
     if is_cl_path(req.uri().path()) {
         return http_proxy(req, state, &state.cfg.cl_beacon_url, &state.client).await;
@@ -334,6 +350,7 @@ async fn bridge_ws<C, U>(
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let _guard = crate::metrics::ActiveConnectionGuard::new("ws");
     let (mut c_tx, mut c_rx) = client_ws.split();
     let (mut u_tx, mut u_rx) = upstream_ws.split();
 

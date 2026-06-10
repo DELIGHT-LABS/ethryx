@@ -9,6 +9,7 @@
 pub mod config;
 mod headers;
 mod health;
+pub mod metrics;
 mod proxy;
 mod state;
 
@@ -87,6 +88,8 @@ where
     // background so /healthz and /readyz read a snapshot instead of hitting
     // upstream on every probe.
     let first_probe = Arc::new(health::probe_once(&state).await);
+    let first_report = health::evaluate_ready(&state, &first_probe);
+    health::update_metrics(&first_probe, &first_report);
     let el_proto = if state.el_use_h2.load(Ordering::Relaxed) {
         "HTTP/2 (h2c)"
     } else {
@@ -159,7 +162,7 @@ where
 /// Health-probe paths, excluded from the access log: k8s liveness/readiness and
 /// LB checks hit these every few seconds, so logging them would bury real traffic.
 fn is_probe_path(path: &str) -> bool {
-    matches!(path, "/livez" | "/readyz" | "/healthz")
+    matches!(path, "/livez" | "/readyz" | "/healthz" | "/metrics")
 }
 
 async fn accept_loop(
@@ -262,6 +265,10 @@ async fn accept_loop(
                                 "request"
                             );
                         }
+                        let status_str = status.to_string();
+                        let metrics = crate::metrics::metrics();
+                        metrics.proxy_requests_total.with_label_values(&[upstream_type, method.as_str(), &status_str]).inc();
+                        metrics.proxy_request_duration_seconds.with_label_values(&[upstream_type]).observe(elapsed.as_secs_f64());
                         res
                     }
                 });
@@ -269,6 +276,7 @@ async fn accept_loop(
                 let conn_tx = conn_tx.clone();
                 tokio::spawn(async move {
                     let _conn_tx = conn_tx;
+                    let _guard = crate::metrics::ActiveConnectionGuard::new("tcp");
                     // Auto-detect HTTP/1 vs HTTP/2 (incl. cleartext h2c preface);
                     // `_with_upgrades` keeps HTTP/1.1 WebSocket Upgrade working;
                     // `enable_connect_protocol` advertises RFC 8441 Extended CONNECT

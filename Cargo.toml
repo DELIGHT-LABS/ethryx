@@ -26,6 +26,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["raw_value"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+prometheus = { version = "0.13", default-features = false, features = ["process"] }
 
 [profile.release]
 lto = "thin"
