@@ -204,11 +204,10 @@ RUST_LOG=ethryx=debug,hyper=warn ethryx ...
 
 ### Access log
 
-For a per-connection trail — peer, the negotiated `HTTP/1.1` vs `HTTP/2`, the
-first request's method and path, the upstream destination (`EL`/`CL`), and the upstream protocol (`HTTP`/`WS`) — enable `--access-log` (`ETHRYX_ACCESS_LOG`). It
-emits one line per connection on a dedicated `access_log` target, kept separate
+For a per-request trail — peer, HTTP version, method, path, upstream destination (`EL`/`CL`), upstream protocol (`HTTP`/`WS`), HTTP status code, and latency in milliseconds — enable `--access-log` (`ETHRYX_ACCESS_LOG`). It
+emits one line per request on a dedicated `access_log` target, kept separate
 from the application log (the nginx / Envoy / Caddy split) so the `info` stream
-stays quiet by default. Health-probe paths (`/livez`, `/readyz`, `/healthz`) are
+stays quiet by default. Health-probe paths (`/livez`, `/readyz`, `/healthz`, `/metrics`) are
 **excluded** even when it's on, so frequent k8s / LB checks don't bury real
 traffic.
 

@@ -10,7 +10,6 @@ use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Role;
 use tracing::{debug, trace};
 
@@ -213,6 +212,13 @@ fn build_ws_request(req: &Request<Incoming>, upstream_url: &str) -> Result<Reque
     Ok(upstream_req)
 }
 
+fn get_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    config.max_message_size = Some(64 * 1024 * 1024); // 64MB
+    config.max_frame_size = Some(16 * 1024 * 1024); // 16MB
+    config
+}
+
 async fn ws_upgrade(
     mut req: Request<Incoming>,
     upstream_url: String,
@@ -225,7 +231,13 @@ async fn ws_upgrade(
     // the handshake instead — and bounds the dial so a hung upstream can't leak
     // a half-open client connection.
     let ws_req = build_ws_request(&req, &upstream_url)?;
-    let upstream_ws = match tokio::time::timeout(connect_timeout, connect_async(ws_req)).await {
+    let ws_config = get_ws_config();
+    let upstream_ws = match tokio::time::timeout(
+        connect_timeout,
+        tokio_tungstenite::connect_async_with_config(ws_req, Some(ws_config), false),
+    )
+    .await
+    {
         Ok(Ok((ws, _))) => ws,
         Ok(Err(e)) => {
             debug!(error = %e, upstream = %upstream_url, "upstream ws connect failed");
@@ -243,7 +255,7 @@ async fn ws_upgrade(
         }
     };
 
-    let (response, websocket) = hyper_tungstenite::upgrade(&mut req, None)?;
+    let (response, websocket) = hyper_tungstenite::upgrade(&mut req, Some(ws_config))?;
     tokio::spawn(async move {
         let client_ws = match websocket.await {
             Ok(ws) => ws,
@@ -270,7 +282,13 @@ async fn ws_upgrade_h2(
     // Dial the upstream WebSocket first, same as the h1 path, so a dead upstream
     // is a 502 rather than an accepted-then-dropped tunnel.
     let ws_req = build_ws_request(&req, &upstream_url)?;
-    let upstream_ws = match tokio::time::timeout(connect_timeout, connect_async(ws_req)).await {
+    let ws_config = get_ws_config();
+    let upstream_ws = match tokio::time::timeout(
+        connect_timeout,
+        tokio_tungstenite::connect_async_with_config(ws_req, Some(ws_config), false),
+    )
+    .await
+    {
         Ok(Ok((ws, _))) => ws,
         Ok(Err(e)) => {
             debug!(error = %e, upstream = %upstream_url, "upstream ws connect failed");
@@ -295,7 +313,7 @@ async fn ws_upgrade_h2(
                 let client_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
                     TokioIo::new(upgraded),
                     Role::Server,
-                    None,
+                    Some(ws_config),
                 )
                 .await;
                 debug!(upstream = %upstream_url, "h2 ws bridge established");
