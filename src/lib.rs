@@ -199,22 +199,71 @@ async fn accept_loop(
                 // request's version is that choice, so log one access line on the
                 // first dispatch — skipping health-probe paths so frequent k8s/LB
                 // checks don't drown the access log.
-                let logged = AtomicBool::new(false);
+                let access_log_enabled = state.cfg.access_log;
                 let svc = service_fn(move |req: Request<Incoming>| {
-                    if !logged.swap(true, Ordering::Relaxed) && !is_probe_path(req.uri().path()) {
-                        let (upstream_type, upstream_proto) = crate::proxy::classify_request(&req);
-                        info!(
-                            target: "access_log",
-                            %peer,
-                            version = ?req.version(),
-                            method = %req.method(),
-                            path = req.uri().path(),
-                            upstream = upstream_type,
-                            proto = upstream_proto,
-                            "connection",
-                        );
+                    let st = st.clone();
+                    let raw_path = req.uri().path();
+                    let is_probe = is_probe_path(raw_path);
+
+                    let method = if !is_probe { Some(req.method().clone()) } else { None };
+                    let version = if !is_probe { Some(req.version()) } else { None };
+                    let path = if !is_probe && access_log_enabled {
+                        raw_path.to_owned()
+                    } else {
+                        String::new()
+                    };
+                    let upstream_data = if !is_probe {
+                        Some(crate::proxy::classify_request(&req))
+                    } else {
+                        None
+                    };
+
+                    let span = if !is_probe {
+                        let ut = upstream_data.unwrap().0;
+                        tracing::info_span!(
+                            "request",
+                            method = %method.as_ref().unwrap(),
+                            path = %path,
+                            upstream = ut,
+                        )
+                    } else {
+                        tracing::Span::none()
+                    };
+
+                    let start = std::time::Instant::now();
+                    use tracing::Instrument;
+                    let dispatch_fut = proxy::dispatch(req, st).instrument(span);
+
+                    async move {
+                        let res = dispatch_fut.await;
+                        if is_probe {
+                            return res;
+                        }
+
+                        let elapsed = start.elapsed();
+                        let status = match &res {
+                            Ok(resp) => resp.status().as_u16(),
+                            Err(_) => 500,
+                        };
+                        let (upstream_type, upstream_proto) = upstream_data.unwrap();
+                        let method = method.unwrap();
+
+                        if access_log_enabled {
+                            info!(
+                                target: "access_log",
+                                %peer,
+                                version = ?version.unwrap(),
+                                method = %method,
+                                path = %path,
+                                upstream = upstream_type,
+                                proto = upstream_proto,
+                                status,
+                                latency_ms = elapsed.as_secs_f64() * 1000.0,
+                                "request"
+                            );
+                        }
+                        res
                     }
-                    proxy::dispatch(req, st.clone())
                 });
                 let mut conn_rx = shutdown_tx.subscribe();
                 let conn_tx = conn_tx.clone();
