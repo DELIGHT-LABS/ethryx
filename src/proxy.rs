@@ -141,6 +141,8 @@ async fn http_proxy(
     client: &ProxyClient,
 ) -> Result<Response<ResBody>, BoxError> {
     let (mut parts, body) = req.into_parts();
+    #[cfg(feature = "otel")]
+    crate::otel::propagate_context(&mut parts.headers);
     let upstream_uri: Uri = {
         let pq = parts.uri.path_and_query().map_or("/", |p| p.as_str());
         format!("{}{}", upstream_base.trim_end_matches('/'), pq).parse()?

@@ -10,6 +10,8 @@ pub mod config;
 mod headers;
 mod health;
 pub mod metrics;
+#[cfg(feature = "otel")]
+pub mod otel;
 mod proxy;
 mod state;
 
@@ -39,6 +41,13 @@ pub async fn run<F>(cfg: Config, shutdown: F) -> Result<(), BoxError>
 where
     F: Future<Output = ()> + Send,
 {
+    #[cfg(feature = "otel")]
+    let _otel_guard = if let Some(ref otel_endpoint) = cfg.otel_endpoint {
+        let tp = crate::otel::init_otel(otel_endpoint)?;
+        Some(tp)
+    } else {
+        None
+    };
     if cfg.listen.is_empty() {
         return Err("no listen addresses configured".into());
     }
@@ -156,6 +165,10 @@ where
         })
         .await;
     }
+    #[cfg(feature = "otel")]
+    if let Some(tp) = _otel_guard {
+        let _ = tp.shutdown();
+    }
     Ok(())
 }
 
@@ -203,6 +216,16 @@ async fn accept_loop(
                 // first dispatch — skipping health-probe paths so frequent k8s/LB
                 // checks don't drown the access log.
                 let access_log_enabled = state.cfg.access_log;
+                let otel_enabled = {
+                    #[cfg(feature = "otel")]
+                    {
+                        state.cfg.otel_endpoint.is_some()
+                    }
+                    #[cfg(not(feature = "otel"))]
+                    {
+                        false
+                    }
+                };
                 let svc = service_fn(move |req: Request<Incoming>| {
                     let st = st.clone();
                     let raw_path = req.uri().path();
@@ -210,7 +233,7 @@ async fn accept_loop(
 
                     let method = if !is_probe { Some(req.method().clone()) } else { None };
                     let version = if !is_probe { Some(req.version()) } else { None };
-                    let path = if !is_probe && access_log_enabled {
+                    let path = if !is_probe && (access_log_enabled || otel_enabled) {
                         raw_path.to_owned()
                     } else {
                         String::new()

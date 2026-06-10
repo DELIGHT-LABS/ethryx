@@ -122,6 +122,8 @@ async fn post_json(c: &TestClient, url: &str, body: Value) -> (StatusCode, Bytes
 struct RecordedRequest {
     method: Method,
     path: String,
+    #[allow(dead_code)]
+    headers: http::HeaderMap,
     version: Version,
     body: Bytes,
 }
@@ -186,6 +188,7 @@ impl MockServer {
                         async move {
                             let method = req.method().clone();
                             let path = req.uri().path().to_owned();
+                            let headers = req.headers().clone();
                             let version = req.version();
                             let body_bytes = req.into_body().collect().await.unwrap().to_bytes();
 
@@ -201,6 +204,7 @@ impl MockServer {
                                         let rr = RecordedRequest {
                                             method: method.clone(),
                                             path: path.clone(),
+                                            headers: headers.clone(),
                                             version,
                                             body: Bytes::from(item_bytes),
                                         };
@@ -231,6 +235,7 @@ impl MockServer {
                                 let rr = RecordedRequest {
                                     method: method.clone(),
                                     path: path.clone(),
+                                    headers: headers.clone(),
                                     version,
                                     body: body_bytes.clone(),
                                 };
@@ -1465,6 +1470,56 @@ async fn metrics_endpoint_returns_formatted_prometheus_metrics() {
     assert!(metrics_str.contains("ethryx_active_connections"));
     assert!(metrics_str.contains("ethryx_upstream_health_status"));
     assert!(metrics_str.contains("ethryx_upstream_peers"));
+
+    ethryx.shutdown().await;
+}
+
+#[cfg(feature = "otel")]
+#[tokio::test]
+async fn trace_context_is_propagated_to_upstream() {
+    let el = MockServer::start(ok_handler()).await;
+    let cl = MockServer::start(ok_handler()).await;
+    let ethryx = EthryxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl.url,
+        "--otel-endpoint",
+        "http://127.0.0.1:4318",
+    ])
+    .await;
+
+    let c = client();
+
+    let traceparent_val = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(ethryx.url("/"))
+        .header("traceparent", traceparent_val)
+        .body(Full::new(Bytes::from(
+            json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1})
+                .to_string(),
+        )))
+        .unwrap();
+
+    let resp = c.request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let received_traceparent_str = {
+        let recorded_reqs = el.recorded.lock().unwrap();
+        let received_traceparent = recorded_reqs
+            .iter()
+            .filter_map(|r| r.headers.get("traceparent"))
+            .next()
+            .expect("traceparent header in any upstream request");
+        received_traceparent.to_str().unwrap().to_owned()
+    };
+
+    assert!(
+        received_traceparent_str.contains("4bf92f3577b34da6a3ce929d0e0e4736"),
+        "Expected propagated traceparent to contain trace ID, got: {}",
+        received_traceparent_str
+    );
 
     ethryx.shutdown().await;
 }
