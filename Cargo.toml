@@ -23,7 +23,7 @@ bytes = "1.11"
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 futures-util = "0.3.32"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde_json = { version = "1.0.150", features = ["raw_value"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
