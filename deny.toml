@@ -13,6 +13,7 @@ allow = [
     "ISC",
     "MIT",
     "Unicode-3.0",
+    "Zlib",
 ]
 
 # `ring` ships a custom multi-license LICENSE bundle that cargo-deny cannot
