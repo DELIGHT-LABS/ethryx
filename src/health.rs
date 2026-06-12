@@ -378,38 +378,26 @@ fn is_transport(e: &HealthError) -> bool {
 }
 
 pub(crate) fn update_metrics(probe: &Probe, report: &ReadyReport) {
-    let metrics = crate::metrics::metrics();
-
     // 1. Upstream Health Status (1 = healthy/synced, 0 = degraded/down)
-    metrics
-        .upstream_health_status
-        .with_label_values(&["el"])
-        .set(if report.el_syncing.ok { 1 } else { 0 });
-    metrics
-        .upstream_health_status
-        .with_label_values(&["cl"])
-        .set(if report.cl_syncing.ok { 1 } else { 0 });
+    ::metrics::gauge!("ethryx_upstream_health_status", "layer" => "el")
+        .set(if report.el_syncing.ok { 1.0 } else { 0.0 });
+    ::metrics::gauge!("ethryx_upstream_health_status", "layer" => "cl")
+        .set(if report.cl_syncing.ok { 1.0 } else { 0.0 });
 
     // 2. EL peers
     if let Ok(peers_hex) = &probe.el_peers {
         if let Some(peers) = hex_to_u64(peers_hex) {
-            metrics
-                .upstream_peers
-                .with_label_values(&["el"])
-                .set(peers as i64);
+            ::metrics::gauge!("ethryx_upstream_peers", "layer" => "el").set(peers as f64);
         }
     } else {
-        metrics.upstream_peers.with_label_values(&["el"]).set(0);
+        ::metrics::gauge!("ethryx_upstream_peers", "layer" => "el").set(0.0);
     }
 
     // 3. CL peers
     if let Ok(peers) = probe.cl_peers {
-        metrics
-            .upstream_peers
-            .with_label_values(&["cl"])
-            .set(peers as i64);
+        ::metrics::gauge!("ethryx_upstream_peers", "layer" => "cl").set(peers as f64);
     } else {
-        metrics.upstream_peers.with_label_values(&["cl"]).set(0);
+        ::metrics::gauge!("ethryx_upstream_peers", "layer" => "cl").set(0.0);
     }
 
     // 4. EL sync distance
@@ -421,32 +409,22 @@ pub(crate) fn update_metrics(probe: &Probe, report: &ReadyReport) {
             let current = hex_to_u64(current_block);
             let highest = hex_to_u64(highest_block);
             if let (Some(c), Some(h)) = (current, highest) {
-                metrics
-                    .upstream_sync_distance
-                    .with_label_values(&["el"])
-                    .set(h.saturating_sub(c) as i64);
+                ::metrics::gauge!("ethryx_upstream_sync_distance", "layer" => "el")
+                    .set(h.saturating_sub(c) as f64);
             }
         }
         _ => {
-            metrics
-                .upstream_sync_distance
-                .with_label_values(&["el"])
-                .set(0);
+            ::metrics::gauge!("ethryx_upstream_sync_distance", "layer" => "el").set(0.0);
         }
     }
 
     // 5. CL sync distance
     if let Ok(status) = &probe.cl_status {
-        metrics
-            .upstream_sync_distance
-            .with_label_values(&["cl"])
-            .set(status.sync_distance as i64);
-        metrics.upstream_slot_number.set(status.head_slot as i64);
+        ::metrics::gauge!("ethryx_upstream_sync_distance", "layer" => "cl")
+            .set(status.sync_distance as f64);
+        ::metrics::gauge!("ethryx_upstream_slot_number").set(status.head_slot as f64);
     } else {
-        metrics
-            .upstream_sync_distance
-            .with_label_values(&["cl"])
-            .set(0);
+        ::metrics::gauge!("ethryx_upstream_sync_distance", "layer" => "cl").set(0.0);
     }
 
     // 6. EL block number
@@ -456,7 +434,7 @@ pub(crate) fn update_metrics(probe: &Probe, report: &ReadyReport) {
         .ok()
         .and_then(|block| hex_to_u64(&block.number))
     {
-        metrics.upstream_block_number.set(num as i64);
+        ::metrics::gauge!("ethryx_upstream_block_number").set(num as f64);
     }
 }
 

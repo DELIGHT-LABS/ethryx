@@ -92,15 +92,14 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
             return Ok(text_response(StatusCode::OK, Bytes::from_static(b"ok")));
         }
         if path == "/metrics" {
-            use prometheus::Encoder;
-            let encoder = prometheus::TextEncoder::new();
-            let metric_families = crate::metrics::metrics().registry.gather();
-            let mut buffer = Vec::new();
-            encoder.encode(&metric_families, &mut buffer).unwrap();
+            let buffer = crate::PROMETHEUS_HANDLE
+                .get()
+                .map(|h| h.render())
+                .unwrap_or_default();
 
             let response = Response::builder()
                 .status(StatusCode::OK)
-                .header("content-type", encoder.format_type())
+                .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
                 .body(crate::proxy::box_full(http_body_util::Full::new(
                     Bytes::from(buffer),
                 )))
