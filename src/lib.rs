@@ -33,6 +33,10 @@ use tracing::{debug, info, trace, warn};
 
 use crate::state::AppState;
 
+use std::sync::OnceLock;
+pub static PROMETHEUS_HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
+    OnceLock::new();
+
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Bind every `cfg.listen` address, serve all routes, and wait for `shutdown`
@@ -41,13 +45,58 @@ pub async fn run<F>(cfg: Config, shutdown: F) -> Result<(), BoxError>
 where
     F: Future<Output = ()> + Send,
 {
+    // Install default rustls cryptoprovider to prevent panics during parallel tests
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+    let prometheus_recorder = prometheus_builder.build_recorder();
+    let prometheus_handle = prometheus_recorder.handle();
+
     #[cfg(feature = "otel")]
     let _otel_guard = if let Some(ref otel_endpoint) = cfg.otel_endpoint {
         let tp = crate::otel::init_otel(otel_endpoint)?;
+        let otel_recorder = crate::otel::OtelRecorder::new();
+        let fanout = metrics_util::layers::FanoutBuilder::default()
+            .add_recorder(prometheus_recorder)
+            .add_recorder(otel_recorder)
+            .build();
+        if ::metrics::set_global_recorder(fanout).is_ok() {
+            let _ = PROMETHEUS_HANDLE.set(prometheus_handle.clone());
+            let handle = prometheus_handle.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    handle.run_upkeep();
+                }
+            });
+        }
         Some(tp)
     } else {
+        if ::metrics::set_global_recorder(prometheus_recorder).is_ok() {
+            let _ = PROMETHEUS_HANDLE.set(prometheus_handle.clone());
+            let handle = prometheus_handle.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    handle.run_upkeep();
+                }
+            });
+        }
         None
     };
+
+    #[cfg(not(feature = "otel"))]
+    if ::metrics::set_global_recorder(prometheus_recorder).is_ok() {
+        let _ = PROMETHEUS_HANDLE.set(prometheus_handle.clone());
+        let handle = prometheus_handle.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                handle.run_upkeep();
+            }
+        });
+    }
+
     if cfg.listen.is_empty() {
         return Err("no listen addresses configured".into());
     }
@@ -289,9 +338,19 @@ async fn accept_loop(
                             );
                         }
                         let status_str = status.to_string();
-                        let metrics = crate::metrics::metrics();
-                        metrics.proxy_requests_total.with_label_values(&[upstream_type, method.as_str(), &status_str]).inc();
-                        metrics.proxy_request_duration_seconds.with_label_values(&[upstream_type]).observe(elapsed.as_secs_f64());
+                        ::metrics::counter!(
+                            "ethryx_proxy_requests_total",
+                            "upstream" => upstream_type,
+                            "method" => method.as_str().to_owned(),
+                            "status" => status_str
+                        )
+                        .increment(1);
+
+                        ::metrics::histogram!(
+                            "ethryx_proxy_request_duration_seconds",
+                            "upstream" => upstream_type
+                        )
+                        .record(elapsed.as_secs_f64());
                         res
                     }
                 });
