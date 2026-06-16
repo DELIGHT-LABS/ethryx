@@ -46,7 +46,7 @@ where
     F: Future<Output = ()> + Send,
 {
     // Install default rustls cryptoprovider to prevent panics during parallel tests
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
     let prometheus_recorder = prometheus_builder.build_recorder();
