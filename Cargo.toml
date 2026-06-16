@@ -27,8 +27,8 @@ serde_json = { version = "1.0.150", features = ["raw_value"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
-metrics-util = "0.18"
+metrics-exporter-prometheus = "0.18"
+metrics-util = "0.20"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 
