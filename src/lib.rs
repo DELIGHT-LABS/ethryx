@@ -337,12 +337,13 @@ async fn accept_loop(
                                 "request"
                             );
                         }
-                        let status_str = status.to_string();
+                        let method_static = method_to_static_str(&method);
+                        let status_static = status_to_static_str(status);
                         ::metrics::counter!(
                             "ethryx_proxy_requests_total",
                             "upstream" => upstream_type,
-                            "method" => method.as_str().to_owned(),
-                            "status" => status_str
+                            "method" => method_static,
+                            "status" => status_static
                         )
                         .increment(1);
 
@@ -385,5 +386,80 @@ async fn accept_loop(
                 });
             }
         }
+    }
+}
+
+fn method_to_static_str(m: &hyper::http::Method) -> &'static str {
+    match m.as_str() {
+        "GET" => "GET",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "DELETE" => "DELETE",
+        "OPTIONS" => "OPTIONS",
+        "HEAD" => "HEAD",
+        "PATCH" => "PATCH",
+        "CONNECT" => "CONNECT",
+        "TRACE" => "TRACE",
+        _ => "OTHER",
+    }
+}
+
+fn status_to_static_str(status: u16) -> &'static str {
+    match status {
+        100 => "100",
+        101 => "101",
+        200 => "200",
+        201 => "201",
+        202 => "202",
+        204 => "204",
+        206 => "206",
+        301 => "301",
+        302 => "302",
+        304 => "304",
+        400 => "400",
+        401 => "401",
+        403 => "403",
+        404 => "404",
+        405 => "405",
+        409 => "409",
+        415 => "415",
+        429 => "429",
+        500 => "500",
+        502 => "502",
+        503 => "503",
+        504 => "504",
+        _ => "OTHER",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper::http::Method;
+
+    #[test]
+    fn test_method_to_static_str() {
+        assert_eq!(method_to_static_str(&Method::GET), "GET");
+        assert_eq!(method_to_static_str(&Method::POST), "POST");
+        assert_eq!(method_to_static_str(&Method::CONNECT), "CONNECT");
+        assert_eq!(
+            method_to_static_str(&Method::from_bytes(b"OPTIONS").unwrap()),
+            "OPTIONS"
+        );
+        // Edge case: Custom method falls back to OTHER
+        assert_eq!(
+            method_to_static_str(&Method::from_bytes(b"PURGE").unwrap()),
+            "OTHER"
+        );
+    }
+
+    #[test]
+    fn test_status_to_static_str() {
+        assert_eq!(status_to_static_str(200), "200");
+        assert_eq!(status_to_static_str(404), "404");
+        assert_eq!(status_to_static_str(502), "502");
+        // Edge case: Custom/unmapped status falls back to OTHER
+        assert_eq!(status_to_static_str(418), "OTHER");
+        assert_eq!(status_to_static_str(307), "OTHER");
     }
 }
