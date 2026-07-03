@@ -27,6 +27,7 @@ pub fn build_client(force_h2: bool) -> ProxyClient {
     let mut http = HttpConnector::new();
     http.set_nodelay(true);
     http.enforce_http(false);
+    http.set_keepalive(Some(Duration::from_secs(60)));
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_webpki_roots()
         .https_or_http()
@@ -255,7 +256,10 @@ async fn ws_upgrade(
     )
     .await
     {
-        Ok(Ok((ws, _))) => ws,
+        Ok(Ok((ws, _))) => {
+            configure_ws_keepalive(&ws);
+            ws
+        }
         Ok(Err(e)) => {
             debug!(error = %e, upstream = %upstream_url, "upstream ws connect failed");
             return Ok(text_response(
@@ -306,7 +310,10 @@ async fn ws_upgrade_h2(
     )
     .await
     {
-        Ok(Ok((ws, _))) => ws,
+        Ok(Ok((ws, _))) => {
+            configure_ws_keepalive(&ws);
+            ws
+        }
         Ok(Err(e)) => {
             debug!(error = %e, upstream = %upstream_url, "upstream ws connect failed");
             return Ok(text_response(
@@ -415,6 +422,28 @@ pub fn text_response(code: StatusCode, msg: impl Into<Bytes>) -> Response<ResBod
         .header("content-type", "text/plain; charset=utf-8")
         .body(box_full(Full::new(msg.into())))
         .unwrap()
+}
+
+fn configure_ws_keepalive(
+    ws: &tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) {
+    let inner = ws.get_ref();
+    let tcp_stream = match inner {
+        tokio_tungstenite::MaybeTlsStream::Plain(s) => Some(s),
+        tokio_tungstenite::MaybeTlsStream::Rustls(s) => Some(s.get_ref().0),
+        _ => None,
+    };
+    if let Some(stream) = tcp_stream {
+        let sock_ref = socket2::SockRef::from(stream);
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(60))
+            .with_interval(Duration::from_secs(10));
+        if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+            debug!(error = %e, "failed to set upstream WS TCP keepalive");
+        }
+    }
 }
 
 #[cfg(test)]

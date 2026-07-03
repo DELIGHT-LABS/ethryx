@@ -252,6 +252,13 @@ async fn accept_loop(
                 if let Err(e) = stream.set_nodelay(true) {
                     debug!(error = %e, "set_nodelay failed");
                 }
+                let sock_ref = socket2::SockRef::from(&stream);
+                let keepalive = socket2::TcpKeepalive::new()
+                    .with_time(Duration::from_secs(60))
+                    .with_interval(Duration::from_secs(10));
+                if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+                    debug!(error = %e, "failed to set TCP keepalive");
+                }
                 // Connection lifecycle is fine-grained, high-frequency detail, so
                 // it lives at trace (accept/close) and on a dedicated `access_log`
                 // target (the negotiated protocol + first request line) rather
