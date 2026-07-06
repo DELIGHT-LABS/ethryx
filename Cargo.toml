@@ -3,11 +3,11 @@ name = "ethryx"
 version = "0.2.2"
 edition = "2024"
 rust-version = "1.95"
-description = "Lightweight Rust sidecar multiplexing HTTP/WS and surfacing health for Ethereum EL/CL nodes."
+description = "Lightweight Rust reverse proxy and health-check sidecar for Ethereum EL/CL nodes."
 license = "MIT"
 repository = "https://github.com/DELIGHT-LABS/ethryx"
 readme = "README.md"
-keywords = ["ethereum", "sidecar", "proxy", "json-rpc", "beacon-api"]
+keywords = ["ethereum", "sidecar", "proxy", "reverse-proxy", "json-rpc", "beacon-api"]
 categories = ["network-programming"]
 
 [dependencies]

@@ -5,8 +5,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust 1.95+](https://img.shields.io/badge/rust-1.95%2B-blue.svg)](rust-toolchain.toml)
 
-Lightweight Rust sidecar that multiplexes HTTP / WebSocket traffic and surfaces
-health for an Ethereum **Execution Layer** (EL) and **Consensus Layer** (CL) pair.
+Lightweight Rust reverse proxy and health-check sidecar for Ethereum **Execution Layer** (EL)
+and **Consensus Layer** (CL) node pairs.
 
 ## Routing
 

@@ -35,7 +35,7 @@ impl Network {
 #[command(
     name = "ethryx",
     version,
-    about = "Ethryx — Ethereum EL/CL sidecar (HTTP + WS multiplexing, health)"
+    about = "Ethryx — Ethereum EL/CL reverse proxy & health-check sidecar"
 )]
 pub struct Config {
     /// Listen address (host:port). Repeat the flag or comma-separate for multi-port.
