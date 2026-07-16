@@ -14,8 +14,8 @@ categories = ["network-programming"]
 clap = { version = "4.6", features = ["derive", "env"] }
 hyper = { version = "1.10", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1", "http2", "server-auto", "tokio"] }
-hyper-tungstenite = "0.20"
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+hyper-tungstenite = "0.30"
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "aws-lc-rs", "webpki-tokio", "tls12"] }
 http = "1.4"
 http-body-util = "0.1.3"
