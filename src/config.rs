@@ -139,6 +139,17 @@ pub struct Config {
     )]
     pub access_log: bool,
 
+    /// Trust the upstream node: disable background health polling (0 RPC cost for paid endpoints) and always report healthy/ready.
+    #[arg(
+        long,
+        env = "ETHRYX_TRUST_UPSTREAM",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub trust_upstream: bool,
+
     /// Upstream timeout for proxied requests (seconds).
     #[arg(long, env = "ETHRYX_PROXY_TIMEOUT", default_value = "60", value_parser = parse_secs)]
     pub proxy_timeout: Duration,
@@ -303,6 +314,16 @@ mod tests {
     #[test]
     fn access_log_bare_flag_enables() {
         assert!(parse(&["--access-log"]).access_log);
+    }
+
+    #[test]
+    fn trust_upstream_defaults_off() {
+        assert!(!parse(&[]).trust_upstream);
+    }
+
+    #[test]
+    fn trust_upstream_bare_flag_enables() {
+        assert!(parse(&["--trust-upstream"]).trust_upstream);
     }
 
     #[test]

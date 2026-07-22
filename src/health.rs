@@ -200,10 +200,56 @@ pub fn ready(state: &AppState) -> Response<ResBody> {
     json_response(code, &report)
 }
 
+/// `/eth/v1/node/health` — Consensus Layer Beacon API standard node health endpoint.
+///
+/// Returns standard status codes according to the Ethereum Beacon API specification:
+/// - 200 OK: Node is healthy and fully synced.
+/// - 206 Partial Content: Node is functional but syncing.
+/// - 503 Service Unavailable: Node is unhealthy, uninitialized, or experiencing upstream errors.
+///
+/// Serves an empty body with `content-type: application/json` in compliance with the spec.
+pub fn node_health(state: &AppState) -> Response<ResBody> {
+    let probe = state.probe.borrow();
+    let report = evaluate_ready(state, &probe);
+    let code = if report.status == "ready" {
+        StatusCode::OK
+    } else if matches!(
+        probe.el_syncing,
+        Ok(ElSyncingResult::Synced(true)) | Ok(ElSyncingResult::Syncing { .. })
+    ) || matches!(&probe.cl_status, Ok(s) if s.is_syncing)
+    {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    Response::builder()
+        .status(code)
+        .header("content-type", "application/json")
+        .body(box_full(Full::new(Bytes::new())))
+        .expect("response builder")
+}
+
 /// Build the `/readyz` verdict from a probe snapshot. Default gates on EL + CL
 /// sync only; `--readyz-strict` also gates on block / slot freshness. Shared by
 /// the endpoint and the poller's transition logging.
 pub(crate) fn evaluate_ready(state: &AppState, probe: &Probe) -> ReadyReport {
+    if state.cfg.trust_upstream {
+        return ReadyReport {
+            status: "ready",
+            el_syncing: Check {
+                ok: true,
+                detail: "synced (trusted upstream)".into(),
+            },
+            cl_syncing: Check {
+                ok: true,
+                detail: "synced (trusted upstream)".into(),
+            },
+            el_block_fresh: None,
+            cl_slot_fresh: None,
+        };
+    }
+
     let el_syncing = check_el_syncing(&probe.el_syncing);
     let cl_syncing = check_cl_syncing(&probe.cl_status);
     // `now` is only needed for the strict freshness checks; the default
@@ -260,6 +306,23 @@ fn readiness_transition(prev_ready: Option<bool>, ready: bool) -> Transition {
 /// Query all five upstream signals once. Each call is bounded by
 /// `--health-timeout`; failures land in the result rather than aborting.
 pub(crate) async fn probe_once(state: &AppState) -> Probe {
+    if state.cfg.trust_upstream {
+        return Probe {
+            el_syncing: Ok(ElSyncingResult::Synced(false)),
+            el_peers: Ok("0x64".into()),
+            el_block: Ok(ElBlockResult {
+                number: "0x0".into(),
+                timestamp: "0x0".into(),
+            }),
+            cl_status: Ok(ClStatus {
+                head_slot: 0,
+                sync_distance: 0,
+                is_syncing: false,
+            }),
+            cl_peers: Ok(64),
+        };
+    }
+
     // Probe EL in a single batch request, which also performs transport detection.
     let batch = el_batch_detect(state).await;
     let (cl_status, cl_peers) = tokio::join!(cl_syncing_status(state), cl_peer_count(state));

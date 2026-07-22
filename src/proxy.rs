@@ -79,18 +79,27 @@ pub(crate) fn is_cl_path(path: &str) -> bool {
     }
 }
 
+fn to_head_response(res: Response<ResBody>) -> Response<ResBody> {
+    let (parts, _) = res.into_parts();
+    Response::from_parts(parts, box_full(http_body_util::Full::new(Bytes::new())))
+}
+
 async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResBody>, BoxError> {
     trace!(method = %req.method(), path = req.uri().path(), "routing request");
-    if req.method() == Method::GET {
+    let is_head = req.method() == Method::HEAD;
+    if req.method() == Method::GET || is_head {
         let path = req.uri().path();
         if path == "/healthz" {
-            return Ok(health::report(state));
+            let res = health::report(state);
+            return Ok(if is_head { to_head_response(res) } else { res });
         }
         if path == "/readyz" {
-            return Ok(health::ready(state));
+            let res = health::ready(state);
+            return Ok(if is_head { to_head_response(res) } else { res });
         }
         if path == "/livez" {
-            return Ok(text_response(StatusCode::OK, Bytes::from_static(b"ok")));
+            let res = text_response(StatusCode::OK, Bytes::from_static(b"ok"));
+            return Ok(if is_head { to_head_response(res) } else { res });
         }
         if path == "/metrics" {
             let buffer = crate::PROMETHEUS_HANDLE
@@ -98,15 +107,20 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
                 .map(|h| h.render())
                 .unwrap_or_default();
 
-            let response = Response::builder()
+            let res = Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
                 .body(crate::proxy::box_full(http_body_util::Full::new(
                     Bytes::from(buffer),
                 )))
                 .unwrap();
-            return Ok(response);
+            return Ok(if is_head { to_head_response(res) } else { res });
         }
+    }
+    if (req.method() == Method::GET || req.method() == Method::HEAD)
+        && req.uri().path() == "/eth/v1/node/health"
+    {
+        return Ok(health::node_health(state));
     }
     if is_cl_path(req.uri().path()) {
         return http_proxy(req, state, &state.cfg.cl_beacon_url, &state.client).await;

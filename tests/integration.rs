@@ -1474,6 +1474,96 @@ async fn metrics_endpoint_returns_formatted_prometheus_metrics() {
     ethryx.shutdown().await;
 }
 
+#[tokio::test]
+async fn test_cl_node_health_intercept_and_passthrough() {
+    let el = MockServer::start(Arc::new(|req| {
+        if req.body.windows(11).any(|w| w == b"eth_syncing") {
+            (
+                StatusCode::OK,
+                br#"{"jsonrpc":"2.0","id":1,"result":false}"#.to_vec(),
+            )
+        } else {
+            (StatusCode::OK, b"{}".to_vec())
+        }
+    }))
+    .await;
+
+    let cl_mock_synced = MockServer::start(Arc::new(|req| {
+        if req.path == "/eth/v1/node/syncing" {
+            (
+                StatusCode::OK,
+                br#"{"data":{"is_syncing":false,"sync_distance":"0","head_slot":"100"}}"#.to_vec(),
+            )
+        } else {
+            (
+                StatusCode::BAD_REQUEST,
+                b"{\"error\": \"Unsupported method\"}".to_vec(),
+            )
+        }
+    }))
+    .await;
+
+    let ethryx = EthryxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl_mock_synced.url,
+    ])
+    .await;
+
+    let c = client();
+
+    // GET /eth/v1/node/health returns 200 OK (intercepted, empty body)
+    let (status, body) = get(&c, &ethryx.url("/eth/v1/node/health")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_empty());
+
+    // HEAD on /readyz, /healthz, /livez, /metrics, and /eth/v1/node/health return 200 OK
+    for path in [
+        "/readyz",
+        "/healthz",
+        "/livez",
+        "/metrics",
+        "/eth/v1/node/health",
+    ] {
+        let req_h = Request::builder()
+            .method(Method::HEAD)
+            .uri(ethryx.url(path))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp_h = c.request(req_h).await.unwrap();
+        assert_eq!(
+            resp_h.status(),
+            StatusCode::OK,
+            "HEAD {} should return 200 OK",
+            path
+        );
+    }
+
+    ethryx.shutdown().await;
+
+    // Test trusted upstream mode (--trust-upstream)
+    let ethryx_trust = EthryxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl_mock_synced.url,
+        "--trust-upstream",
+    ])
+    .await;
+
+    let (status_tr, body_tr) = get(&c, &ethryx_trust.url("/readyz")).await;
+    assert_eq!(status_tr, StatusCode::OK);
+    let ready_val: Value = serde_json::from_slice(&body_tr).unwrap();
+    assert_eq!(ready_val["status"], "ready");
+
+    let (status_tr_nh, body_tr_nh) = get(&c, &ethryx_trust.url("/eth/v1/node/health")).await;
+    assert_eq!(status_tr_nh, StatusCode::OK);
+    assert!(body_tr_nh.is_empty());
+
+    ethryx_trust.shutdown().await;
+}
+
 #[cfg(feature = "otel")]
 #[tokio::test]
 async fn trace_context_is_propagated_to_upstream() {

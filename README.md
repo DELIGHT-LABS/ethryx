@@ -12,10 +12,11 @@ and **Consensus Layer** (CL) node pairs.
 
 | Request                              | Forwarded to        |
 |--------------------------------------|---------------------|
-| `GET /livez`                         | 200 OK (process liveness) |
-| `GET /readyz`                        | EL + CL readiness gate (200 / 503) |
-| `GET /healthz`                       | EL + CL state snapshot (always 200) |
-| `GET /metrics`                       | Prometheus metrics scrape endpoint |
+| `GET/HEAD /livez`                    | 200 OK (process liveness) |
+| `GET/HEAD /readyz`                   | EL + CL readiness gate (200 / 503) |
+| `GET/HEAD /healthz`                  | EL + CL state snapshot (always 200) |
+| `GET/HEAD /metrics`                  | Prometheus metrics scrape endpoint |
+| `GET/HEAD /eth/v1/node/health`       | Beacon API standard node health (200 / 206 / 503) |
 | `/eth/...`, `/lighthouse/...`, `/prysm/...`, `/teku/...`, `/lodestar/...`, `/nimbus/...` | `--cl-beacon-url`   |
 | `Upgrade: websocket`                 | `--el-ws-url`       |
 | everything else (JSON-RPC `POST /`)  | `--el-http-url`     |
@@ -24,12 +25,12 @@ and **Consensus Layer** (CL) node pairs.
 
 Three endpoints, split by purpose (Kubernetes `z` convention):
 
-| Endpoint       | Returns                       | Wire to                     | Gates on                                              |
-|----------------|-------------------------------|-----------------------------|-------------------------------------------------------|
-| `GET /livez`   | always `200`, body `ok`       | liveness probe (restart)    | nothing — only that the process is up; no upstream call |
-| `GET /readyz`  | `200` ready / `503` not ready | readiness probe (LB gate)   | EL + CL **sync status** (plus freshness with `--readyz-strict`) |
-| `GET /healthz` | always `200` + JSON snapshot  | monitoring / alerting / curl | nothing — reports state, never judges                 |
-| `GET /metrics` | Prometheus metrics text format | Prometheus scraper          | nothing — metrics scraper                             |
+| Endpoint            | Returns                       | Wire to                     | Gates on                                              |
+|---------------------|-------------------------------|-----------------------------|-------------------------------------------------------|
+| `GET/HEAD /livez`   | always `200`, body `ok`       | liveness probe (restart)    | nothing — only that the process is up; no upstream call |
+| `GET/HEAD /readyz`  | `200` ready / `503` not ready | readiness probe (LB gate)   | EL + CL **sync status** (plus freshness with `--readyz-strict`) |
+| `GET/HEAD /healthz` | always `200` + JSON snapshot  | monitoring / alerting / curl | nothing — reports state, never judges                 |
+| `GET/HEAD /metrics` | Prometheus metrics text format | Prometheus scraper          | nothing — metrics scraper                             |
 
 `/livez` and `/readyz` differ exactly when the node is up but not serving yet
 (startup, mid-sync, or an upstream is down): `/livez` stays `200` (don't restart
@@ -300,6 +301,16 @@ the raw age regardless. On young testnets or low-traffic private chains, widen
 them (e.g. `120`) so normal slot gaps don't flap readiness. Peer counts no
 longer gate anything — `/healthz` simply reports the live count for your
 monitoring stack to threshold.
+
+### Trusted / Commercial Endpoint Tuning
+
+When running `ethryx` against a fallback/secondary node or a commercial paid RPC provider (e.g., Alchemy, Infura, QuickNode), add `--trust-upstream` (`ETHRYX_TRUST_UPSTREAM`):
+
+| Flag                | Default | Description                                                                 |
+|---------------------|---------|-----------------------------------------------------------------------------|
+| `--trust-upstream`  | `false` | Disable background health polling (0 RPC cost) and always report ready/200. |
+
+When enabled, `ethryx` trusts the upstream node and skips background EL/CL health polling (consuming zero Compute Units / API credits on commercial providers) while continuing to proxy all incoming data-plane traffic normally.
 
 ## Development
 
