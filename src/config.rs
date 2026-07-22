@@ -105,13 +105,13 @@ pub struct Config {
     pub cl_seconds_per_slot: Option<u64>,
 
     /// Upstream timeout for each background health-poll RPC (seconds).
-    #[arg(long, env = "ETHRYX_HEALTH_TIMEOUT", default_value = "3", value_parser = parse_secs)]
+    #[arg(long, env = "ETHRYX_HEALTH_TIMEOUT", default_value = "2", value_parser = parse_secs)]
     pub health_timeout: Duration,
 
     /// Interval between background health polls (seconds). `/healthz` and
     /// `/readyz` serve the latest poll, so upstream load stays constant
     /// regardless of probe rate. Must be at least 1 second.
-    #[arg(long, env = "ETHRYX_HEALTH_POLL_INTERVAL", default_value = "5", value_parser = parse_secs)]
+    #[arg(long, env = "ETHRYX_HEALTH_POLL_INTERVAL", default_value = "1", value_parser = parse_secs)]
     pub health_poll_interval: Duration,
 
     /// Log level used when `RUST_LOG` is unset. `RUST_LOG` overrides this and
@@ -286,8 +286,8 @@ mod tests {
     }
 
     #[test]
-    fn health_poll_interval_defaults_to_5s() {
-        assert_eq!(parse(&[]).health_poll_interval, Duration::from_secs(5));
+    fn health_poll_interval_defaults_to_1s() {
+        assert_eq!(parse(&[]).health_poll_interval, Duration::from_secs(1));
     }
 
     #[test]

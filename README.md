@@ -87,7 +87,7 @@ instead of typing both; `--cl-genesis-time 0` omits `cl.slot_age_secs`.
 ### Polling
 
 `/readyz` and `/healthz` don't query upstream per request. A background task
-polls all signals, then waits `--health-poll-interval` (default 5s; each call
+polls all signals, then waits `--health-poll-interval` (default 1s; each call
 bounded by `--health-timeout`) before the next poll, and the endpoints return
 the latest snapshot instantly — so upstream load is constant regardless of probe
 rate, a slow upstream never blocks a probe, and the poller pauses a full interval
