@@ -132,11 +132,23 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
             .get::<hyper::ext::Protocol>()
             .is_some_and(|p| p.as_str() == "websocket")
     {
-        return ws_upgrade_h2(req, state.cfg.el_ws_url.clone(), state.cfg.proxy_timeout).await;
+        return ws_upgrade_h2(
+            req,
+            state.cfg.el_ws_url.clone(),
+            state.cfg.proxy_timeout,
+            state.cfg.trust_upstream,
+        )
+        .await;
     }
     // HTTP/1.1 Upgrade WebSocket.
     if hyper_tungstenite::is_upgrade_request(&req) {
-        return ws_upgrade(req, state.cfg.el_ws_url.clone(), state.cfg.proxy_timeout).await;
+        return ws_upgrade(
+            req,
+            state.cfg.el_ws_url.clone(),
+            state.cfg.proxy_timeout,
+            state.cfg.trust_upstream,
+        )
+        .await;
     }
     // The health poller decides the EL transport (h2c vs h1); the data-plane just
     // follows its verdict.
@@ -145,15 +157,110 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
     } else {
         &state.client
     };
+
+    if req.method() == Method::POST && !is_cl_path(req.uri().path()) && state.cfg.trust_upstream {
+        let (parts, body) = req.into_parts();
+        match http_body_util::BodyExt::collect(body).await {
+            Ok(collected) => {
+                let bytes = collected.to_bytes();
+                if let Some(mock_res) = try_mock_eth_syncing(&bytes) {
+                    return Ok(mock_res);
+                }
+                let req = Request::from_parts(parts, box_full(Full::new(bytes)));
+                return http_proxy(req, state, &state.cfg.el_http_url, el_client).await;
+            }
+            Err(e) => {
+                return Ok(text_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to read request body: {e}"),
+                ));
+            }
+        }
+    }
+
     http_proxy(req, state, &state.cfg.el_http_url, el_client).await
 }
 
-async fn http_proxy(
-    req: Request<Incoming>,
+fn try_mock_eth_syncing(bytes: &[u8]) -> Option<Response<ResBody>> {
+    if !bytes.windows(11).any(|w| w == b"eth_syncing") {
+        return None;
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RpcReq<'a> {
+        method: Option<&'a str>,
+        #[serde(borrow)]
+        id: Option<&'a serde_json::value::RawValue>,
+    }
+
+    if let Ok(req) = serde_json::from_slice::<RpcReq>(bytes) {
+        if req.method == Some("eth_syncing") {
+            let id_str = req.id.map(|v| v.get()).unwrap_or("null");
+            let body = format!(r#"{{"jsonrpc":"2.0","id":{},"result":false}}"#, id_str);
+            let res = Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(box_full(Full::new(Bytes::from(body))))
+                .unwrap();
+            return Some(res);
+        }
+    } else if let Ok(reqs) = serde_json::from_slice::<Vec<RpcReq>>(bytes)
+        && !reqs.is_empty()
+        && reqs.iter().all(|r| r.method == Some("eth_syncing"))
+    {
+        let mut items = Vec::with_capacity(reqs.len());
+        for r in reqs {
+            let id_str = r.id.map(|v| v.get()).unwrap_or("null");
+            items.push(format!(
+                r#"{{"jsonrpc":"2.0","id":{},"result":false}}"#,
+                id_str
+            ));
+        }
+        let body = format!("[{}]", items.join(","));
+        let res = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(box_full(Full::new(Bytes::from(body))))
+            .unwrap();
+        return Some(res);
+    }
+    None
+}
+
+fn try_mock_ws_eth_syncing(text: &str) -> Option<String> {
+    if !text.contains("eth_syncing") {
+        return None;
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RpcReq<'a> {
+        method: Option<&'a str>,
+        #[serde(borrow)]
+        id: Option<&'a serde_json::value::RawValue>,
+    }
+
+    if let Ok(req) = serde_json::from_str::<RpcReq>(text)
+        && req.method == Some("eth_syncing")
+    {
+        let id_str = req.id.map(|v| v.get()).unwrap_or("null");
+        return Some(format!(
+            r#"{{"jsonrpc":"2.0","id":{},"result":false}}"#,
+            id_str
+        ));
+    }
+    None
+}
+
+async fn http_proxy<B>(
+    req: Request<B>,
     state: &AppState,
     upstream_base: &str,
     client: &ProxyClient,
-) -> Result<Response<ResBody>, BoxError> {
+) -> Result<Response<ResBody>, BoxError>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<BoxError>,
+{
     let (mut parts, body) = req.into_parts();
     #[cfg(feature = "otel")]
     crate::otel::propagate_context(&mut parts.headers);
@@ -255,6 +362,7 @@ async fn ws_upgrade(
     mut req: Request<Incoming>,
     upstream_url: String,
     connect_timeout: Duration,
+    trust_upstream: bool,
 ) -> Result<Response<ResBody>, BoxError> {
     // Dial the upstream WebSocket *before* completing the client upgrade. If we
     // returned 101 first and the upstream were down, the client would see a
@@ -300,7 +408,7 @@ async fn ws_upgrade(
             }
         };
         debug!(upstream = %upstream_url, "ws bridge established");
-        bridge_ws(client_ws, upstream_ws).await;
+        bridge_ws(client_ws, upstream_ws, trust_upstream).await;
     });
     Ok(response.map(box_full))
 }
@@ -313,6 +421,7 @@ async fn ws_upgrade_h2(
     req: Request<Incoming>,
     upstream_url: String,
     connect_timeout: Duration,
+    trust_upstream: bool,
 ) -> Result<Response<ResBody>, BoxError> {
     // Dial the upstream WebSocket first, same as the h1 path, so a dead upstream
     // is a 502 rather than an accepted-then-dropped tunnel.
@@ -355,7 +464,7 @@ async fn ws_upgrade_h2(
                 )
                 .await;
                 debug!(upstream = %upstream_url, "h2 ws bridge established");
-                bridge_ws(client_ws, upstream_ws).await;
+                bridge_ws(client_ws, upstream_ws, trust_upstream).await;
             }
             Err(e) => debug!(error = %e, "h2 ws upgrade failed"),
         }
@@ -368,24 +477,42 @@ async fn ws_upgrade_h2(
 async fn bridge_ws<C, U>(
     client_ws: tokio_tungstenite::WebSocketStream<C>,
     upstream_ws: tokio_tungstenite::WebSocketStream<U>,
+    trust_upstream: bool,
 ) where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let _guard = crate::metrics::ActiveConnectionGuard::new("ws");
-    let (mut c_tx, mut c_rx) = client_ws.split();
+    let (c_tx, mut c_rx) = client_ws.split();
     let (mut u_tx, mut u_rx) = upstream_ws.split();
+    let c_tx = Arc::new(tokio::sync::Mutex::new(c_tx));
+    let c_tx_clone = c_tx.clone();
 
-    let c2u = async {
+    let c2u = async move {
         while let Some(Ok(m)) = c_rx.next().await {
+            if trust_upstream
+                && let Ok(text) = m.to_text()
+                && let Some(resp) = try_mock_ws_eth_syncing(text)
+            {
+                if c_tx_clone
+                    .lock()
+                    .await
+                    .send(tokio_tungstenite::tungstenite::Message::Text(resp.into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
             if u_tx.send(m).await.is_err() {
                 break;
             }
         }
     };
-    let u2c = async {
+    let u2c = async move {
         while let Some(Ok(m)) = u_rx.next().await {
-            if c_tx.send(m).await.is_err() {
+            if c_tx.lock().await.send(m).await.is_err() {
                 break;
             }
         }
@@ -533,5 +660,43 @@ mod tests {
         req.extensions_mut()
             .insert(hyper::ext::Protocol::from_static("websocket"));
         assert_eq!(classify_request(&req), ("EL", "WS"));
+    }
+
+    #[tokio::test]
+    async fn test_try_mock_eth_syncing() {
+        // Single eth_syncing request
+        let req = r#"{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":100}"#;
+        let res = try_mock_eth_syncing(req.as_bytes()).unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(res.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(body, r#"{"jsonrpc":"2.0","id":100,"result":false}"#);
+
+        // Non-eth_syncing request should return None
+        let req = r#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":101}"#;
+        assert!(try_mock_eth_syncing(req.as_bytes()).is_none());
+
+        // Batch eth_syncing request
+        let batch = r#"[{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}]"#;
+        let res = try_mock_eth_syncing(batch.as_bytes()).unwrap();
+        let body = http_body_util::BodyExt::collect(res.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(body, r#"[{"jsonrpc":"2.0","id":1,"result":false}]"#);
+    }
+
+    #[test]
+    fn test_try_mock_ws_eth_syncing() {
+        let req = r#"{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":42}"#;
+        assert_eq!(
+            try_mock_ws_eth_syncing(req).unwrap(),
+            r#"{"jsonrpc":"2.0","id":42,"result":false}"#
+        );
+
+        let non_syncing = r#"{"jsonrpc":"2.0","method":"eth_call","params":[],"id":43}"#;
+        assert!(try_mock_ws_eth_syncing(non_syncing).is_none());
     }
 }
