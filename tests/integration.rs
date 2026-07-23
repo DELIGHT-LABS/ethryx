@@ -1613,3 +1613,70 @@ async fn trace_context_is_propagated_to_upstream() {
 
     ethryx.shutdown().await;
 }
+
+#[tokio::test]
+async fn trust_upstream_mocks_eth_syncing_http_and_ws() {
+    let el_ws_port = pick_port().await;
+    let ws_listener = TcpListener::bind(("127.0.0.1", el_ws_port)).await.unwrap();
+    let ws_upstream = format!("ws://127.0.0.1:{el_ws_port}");
+
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = ws_listener.accept().await {
+            if let Ok(ws) = accept_async(stream).await {
+                let (mut tx, mut rx) = ws.split();
+                while let Some(Ok(msg)) = rx.next().await {
+                    if tx.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let el = MockServer::start(ok_handler()).await;
+    let cl = MockServer::start(ok_handler()).await;
+
+    let ethryx = EthryxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl.url,
+        "--el-ws-url",
+        &ws_upstream,
+        "--trust-upstream",
+    ])
+    .await;
+
+    let c = client();
+
+    // 1. HTTP eth_syncing should be mocked by ethryx without hitting upstream
+    let (status, body) = post_json(
+        &c,
+        &ethryx.url("/"),
+        json!({"jsonrpc": "2.0", "method": "eth_syncing", "params": [], "id": 55}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let val: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(val["id"], 55);
+    assert_eq!(val["result"], false);
+
+    // 2. WS eth_syncing should be mocked by ethryx
+    let ws_url = format!("ws://127.0.0.1:{}", ethryx.port);
+    let (mut ws, _) = connect_async(&ws_url).await.expect("ws handshake ok");
+    let ws_req =
+        json!({"jsonrpc": "2.0", "method": "eth_syncing", "params": [], "id": 99}).to_string();
+    ws.send(Message::Text(ws_req.into())).await.unwrap();
+
+    let reply_text = loop {
+        match ws.next().await.expect("a reply").expect("ok frame") {
+            Message::Text(t) => break t,
+            _ => continue,
+        }
+    };
+    let ws_val: Value = serde_json::from_str(&reply_text).unwrap();
+    assert_eq!(ws_val["id"], 99);
+    assert_eq!(ws_val["result"], false);
+
+    ethryx.shutdown().await;
+}
