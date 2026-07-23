@@ -1,20 +1,29 @@
-use http::HeaderMap;
+use std::sync::LazyLock;
 
-const HOP_BY_HOP: &[&str] = &[
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailers",
-    "transfer-encoding",
-    "upgrade",
-    "host",
-    "content-length",
-];
+use http::header::{
+    CONNECTION, CONTENT_LENGTH, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER,
+    TRANSFER_ENCODING, UPGRADE,
+};
+use http::{HeaderMap, HeaderName};
+
+static HOP_BY_HOP: LazyLock<Vec<HeaderName>> = LazyLock::new(|| {
+    vec![
+        CONNECTION,
+        HeaderName::from_static("keep-alive"),
+        PROXY_AUTHENTICATE,
+        PROXY_AUTHORIZATION,
+        TE,
+        TRAILER,
+        HeaderName::from_static("trailers"),
+        TRANSFER_ENCODING,
+        UPGRADE,
+        HOST,
+        CONTENT_LENGTH,
+    ]
+});
 
 pub fn strip_hop_by_hop<T>(headers: &mut HeaderMap<T>) {
-    for &name in HOP_BY_HOP {
+    for name in HOP_BY_HOP.iter() {
         headers.remove(name);
     }
 }
