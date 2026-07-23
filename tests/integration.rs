@@ -1503,7 +1503,8 @@ async fn test_cl_node_health_intercept_and_passthrough() {
     }))
     .await;
 
-    let ethryx = EthryxHandle::start(&[
+    // 1. Default (mock_cl_node_health = false): GET /eth/v1/node/health is proxied (bypassed) to CL upstream
+    let ethryx_default = EthryxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -1512,37 +1513,29 @@ async fn test_cl_node_health_intercept_and_passthrough() {
     .await;
 
     let c = client();
+    let (status_def, body_def) = get(&c, &ethryx_default.url("/eth/v1/node/health")).await;
+    assert_eq!(status_def, StatusCode::BAD_REQUEST);
+    assert_eq!(body_def.as_ref(), b"{\"error\": \"Unsupported method\"}");
 
-    // GET /eth/v1/node/health returns 200 OK (intercepted, empty body)
-    let (status, body) = get(&c, &ethryx.url("/eth/v1/node/health")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(body.is_empty());
+    ethryx_default.shutdown().await;
 
-    // HEAD on /readyz, /healthz, /livez, /metrics, and /eth/v1/node/health return 200 OK
-    for path in [
-        "/readyz",
-        "/healthz",
-        "/livez",
-        "/metrics",
-        "/eth/v1/node/health",
-    ] {
-        let req_h = Request::builder()
-            .method(Method::HEAD)
-            .uri(ethryx.url(path))
-            .body(Full::new(Bytes::new()))
-            .unwrap();
-        let resp_h = c.request(req_h).await.unwrap();
-        assert_eq!(
-            resp_h.status(),
-            StatusCode::OK,
-            "HEAD {} should return 200 OK",
-            path
-        );
-    }
+    // 2. Intercept enabled (--mock-cl-node-health): GET /eth/v1/node/health is intercepted locally
+    let ethryx_mock = EthryxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl_mock_synced.url,
+        "--mock-cl-node-health",
+    ])
+    .await;
 
-    ethryx.shutdown().await;
+    let (status_mock, body_mock) = get(&c, &ethryx_mock.url("/eth/v1/node/health")).await;
+    assert_eq!(status_mock, StatusCode::OK);
+    assert!(body_mock.is_empty());
 
-    // Test trusted upstream mode (--trust-upstream)
+    ethryx_mock.shutdown().await;
+
+    // 3. Trusted upstream (--trust-upstream without --mock-cl-node-health): /readyz is 200, node/health is bypassed
     let ethryx_trust = EthryxHandle::start(&[
         "--el-http-url",
         &el.url,
@@ -1558,8 +1551,8 @@ async fn test_cl_node_health_intercept_and_passthrough() {
     assert_eq!(ready_val["status"], "ready");
 
     let (status_tr_nh, body_tr_nh) = get(&c, &ethryx_trust.url("/eth/v1/node/health")).await;
-    assert_eq!(status_tr_nh, StatusCode::OK);
-    assert!(body_tr_nh.is_empty());
+    assert_eq!(status_tr_nh, StatusCode::BAD_REQUEST);
+    assert_eq!(body_tr_nh.as_ref(), b"{\"error\": \"Unsupported method\"}");
 
     ethryx_trust.shutdown().await;
 }
@@ -1615,7 +1608,7 @@ async fn trace_context_is_propagated_to_upstream() {
 }
 
 #[tokio::test]
-async fn trust_upstream_mocks_eth_syncing_http_and_ws() {
+async fn trust_upstream_decoupled_from_mock_eth_syncing() {
     let el_ws_port = pick_port().await;
     let ws_listener = TcpListener::bind(("127.0.0.1", el_ws_port)).await.unwrap();
     let ws_upstream = format!("ws://127.0.0.1:{el_ws_port}");
@@ -1633,10 +1626,21 @@ async fn trust_upstream_mocks_eth_syncing_http_and_ws() {
         }
     });
 
-    let el = MockServer::start(ok_handler()).await;
+    let el = MockServer::start_h2c(Arc::new(|req| {
+        if req.body.windows(11).any(|w| w == b"eth_syncing") {
+            (
+                StatusCode::OK,
+                br#"{"jsonrpc":"2.0","id":55,"result":"upstream_result"}"#.to_vec(),
+            )
+        } else {
+            (StatusCode::OK, b"{}".to_vec())
+        }
+    }))
+    .await;
     let cl = MockServer::start(ok_handler()).await;
 
-    let ethryx = EthryxHandle::start(&[
+    // 1. --trust-upstream alone (without --mock-eth-syncing): eth_syncing is proxied (bypassed) to EL upstream
+    let ethryx_trust = EthryxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -1648,35 +1652,152 @@ async fn trust_upstream_mocks_eth_syncing_http_and_ws() {
     .await;
 
     let c = client();
-
-    // 1. HTTP eth_syncing should be mocked by ethryx without hitting upstream
-    let (status, body) = post_json(
+    let (status, body) = post_json_settled(
         &c,
-        &ethryx.url("/"),
+        &ethryx_trust.url("/"),
         json!({"jsonrpc": "2.0", "method": "eth_syncing", "params": [], "id": 55}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     let val: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(val["id"], 55);
-    assert_eq!(val["result"], false);
+    assert_eq!(val["result"], "upstream_result");
 
-    // 2. WS eth_syncing should be mocked by ethryx
-    let ws_url = format!("ws://127.0.0.1:{}", ethryx.port);
-    let (mut ws, _) = connect_async(&ws_url).await.expect("ws handshake ok");
-    let ws_req =
-        json!({"jsonrpc": "2.0", "method": "eth_syncing", "params": [], "id": 99}).to_string();
-    ws.send(Message::Text(ws_req.into())).await.unwrap();
+    ethryx_trust.shutdown().await;
 
-    let reply_text = loop {
-        match ws.next().await.expect("a reply").expect("ok frame") {
-            Message::Text(t) => break t,
-            _ => continue,
+    // 2. --mock-eth-syncing enabled: eth_syncing is intercepted locally
+    let ethryx_mock = EthryxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl.url,
+        "--el-ws-url",
+        &ws_upstream,
+        "--mock-eth-syncing",
+    ])
+    .await;
+
+    let (status_m, body_m) = post_json_settled(
+        &c,
+        &ethryx_mock.url("/"),
+        json!({"jsonrpc": "2.0", "method": "eth_syncing", "params": [], "id": 55}),
+    )
+    .await;
+    assert_eq!(status_m, StatusCode::OK);
+    let val_m: Value = serde_json::from_slice(&body_m).unwrap();
+    assert_eq!(val_m["result"], false);
+
+    ethryx_mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_cl_mev_relay_routing() {
+    let el = MockServer::start(Arc::new(|_| (StatusCode::OK, b"{}".to_vec()))).await;
+    let cl = MockServer::start(Arc::new(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            b"{\"error\": \"Unsupported method\"}".to_vec(),
+        )
+    }))
+    .await;
+    let mev_relay = MockServer::start(Arc::new(|req| {
+        if req.path == "/eth/v1/builder/validators" && req.method == "POST" {
+            (StatusCode::OK, b"[]".to_vec())
+        } else {
+            (StatusCode::NOT_FOUND, b"not found".to_vec())
         }
-    };
-    let ws_val: Value = serde_json::from_str(&reply_text).unwrap();
-    assert_eq!(ws_val["id"], 99);
-    assert_eq!(ws_val["result"], false);
+    }))
+    .await;
+
+    let ethryx = EthryxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl.url,
+        "--cl-mev-relay-url",
+        &mev_relay.url,
+    ])
+    .await;
+
+    let c = client();
+    let (status, body) = post_json(
+        &c,
+        &ethryx.url("/eth/v1/validator/register_validator"),
+        json!([]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_ref(), b"[]");
+
+    ethryx.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_mock_cl_subscriptions() {
+    let el = MockServer::start(Arc::new(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            b"should not be called".to_vec(),
+        )
+    }))
+    .await;
+    let cl = MockServer::start(Arc::new(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            b"should not be called".to_vec(),
+        )
+    }))
+    .await;
+
+    let ethryx = EthryxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl.url,
+        "--mock-cl-subscriptions",
+    ])
+    .await;
+
+    let c = client();
+
+    for path in [
+        "/eth/v1/validator/prepare_beacon_proposer",
+        "/eth/v1/validator/beacon_committee_subscriptions",
+        "/eth/v1/validator/sync_committee_subscriptions",
+    ] {
+        let (status, body) = post_json(&c, &ethryx.url(path), json!([])).await;
+        assert_eq!(status, StatusCode::OK, "Failed for path: {path}");
+        assert_eq!(
+            body.as_ref(),
+            b"{\"code\":200,\"message\":\"success\"}",
+            "Failed for path: {path}"
+        );
+    }
+
+    ethryx.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_mock_eth_syncing_flag() {
+    let el = MockServer::start(Arc::new(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            b"should not be called".to_vec(),
+        )
+    }))
+    .await;
+
+    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--mock-eth-syncing"]).await;
+
+    let c = client();
+    let (status, body) = post_json(
+        &c,
+        &ethryx.url("/"),
+        json!({"jsonrpc": "2.0", "id": 1, "method": "eth_syncing", "params": []}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["result"], false);
 
     ethryx.shutdown().await;
 }
