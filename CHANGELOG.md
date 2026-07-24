@@ -22,6 +22,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Preserved upstream URI path components without appending unnecessary trailing slashes (`/`) during root request proxying and WebSocket handshakes, preventing HTTP 400 `Unsupported method: /` errors from commercial RPC providers (Alchemy).
 
+## [0.2.4] - 2026-07-23
+
+### Added
+
+- Static mocking for `eth_syncing` JSON-RPC requests over HTTP POST and WebSocket frames when `--trust-upstream` flag is enabled.
+
+### Changed
+
+- Optimized hop-by-hop header removal using static `HeaderName` constants to eliminate per-request header name string parsing.
+
+## [0.2.3] - 2026-07-22
+
 ## [0.2.2] - 2026-07-03
 
 ## [0.2.1] - 2026-06-16
