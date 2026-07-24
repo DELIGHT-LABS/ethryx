@@ -332,7 +332,12 @@ where
         }
         None => {
             let pq = parts.uri.path_and_query().map_or("/", |p| p.as_str());
-            format!("{}{}", upstream_base.trim_end_matches('/'), pq).parse()?
+            if pq == "/" {
+                upstream_base.parse()?
+            } else {
+                let base = upstream_base.trim_end_matches('/');
+                format!("{base}{pq}").parse()?
+            }
         }
     };
     parts.uri = upstream_uri;
@@ -372,7 +377,12 @@ fn build_ws_request(req: &Request<Incoming>, upstream_url: &str) -> Result<Reque
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
-    let target_uri = format!("{}{}", upstream_url.trim_end_matches('/'), req_pq);
+    let target_uri = if req_pq == "/" {
+        upstream_url.to_string()
+    } else {
+        let base = upstream_url.trim_end_matches('/');
+        format!("{base}{req_pq}")
+    };
     let parsed_uri: http::Uri = target_uri.parse()?;
 
     let mut upstream_req = Request::builder()

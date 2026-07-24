@@ -1830,3 +1830,51 @@ async fn test_mock_eth_syncing_flag() {
 
     ethryx.shutdown().await;
 }
+
+#[tokio::test]
+#[allow(clippy::result_large_err)]
+async fn test_ws_handshake_preserves_upstream_path_without_trailing_slash() {
+    let captured_uri = Arc::new(std::sync::Mutex::new(String::new()));
+    let captured_uri_clone = captured_uri.clone();
+
+    let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = server.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = server.accept().await {
+            let captured_uri_clone2 = captured_uri_clone.clone();
+            let ws_stream = tokio_tungstenite::accept_hdr_async(
+                stream,
+                move |req: &tokio_tungstenite::tungstenite::handshake::server::Request, res| {
+                    if let Ok(mut guard) = captured_uri_clone2.lock() {
+                        *guard = req.uri().to_string();
+                    }
+                    Ok(res)
+                },
+            )
+            .await;
+
+            if let Ok(mut ws) = ws_stream {
+                while let Some(Ok(msg)) = ws.next().await {
+                    if msg.is_text() || msg.is_binary() {
+                        let _ = ws.send(msg).await;
+                    }
+                }
+            }
+        }
+    });
+
+    let upstream_url = format!("ws://127.0.0.1:{port}/v2/testkey");
+    let ethryx = EthryxHandle::start(&["--el-ws-url", &upstream_url, "--trust-upstream"]).await;
+
+    let ws_url = ethryx.url("/").replace("http://", "ws://");
+    let (ws, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+
+    let _ = ws;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let final_uri = captured_uri.lock().unwrap().clone();
+    assert_eq!(final_uri, "/v2/testkey");
+
+    ethryx.shutdown().await;
+}
