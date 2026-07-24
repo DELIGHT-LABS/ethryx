@@ -17,6 +17,8 @@ and **Consensus Layer** (CL) node pairs.
 | `GET/HEAD /healthz`                  | EL + CL state snapshot (always 200) |
 | `GET/HEAD /metrics`                  | Prometheus metrics scrape endpoint |
 | `GET/HEAD /eth/v1/node/health`       | Beacon API standard node health (200 / 206 / 503) |
+| `POST /eth/v1/validator/register_validator` | `--cl-mev-relay-url` (rewritten to `/eth/v1/builder/validators`) if set, else `--cl-beacon-url` |
+| `POST /eth/v1/validator/prepare_beacon_proposer` | `200 OK` if `--mock-prepare-beacon-proposer` set, else `--cl-beacon-url` |
 | `/eth/...`, `/lighthouse/...`, `/prysm/...`, `/teku/...`, `/lodestar/...`, `/nimbus/...` | `--cl-beacon-url`   |
 | `Upgrade: websocket`                 | `--el-ws-url`       |
 | everything else (JSON-RPC `POST /`)  | `--el-http-url`     |
@@ -302,15 +304,27 @@ them (e.g. `120`) so normal slot gaps don't flap readiness. Peer counts no
 longer gate anything — `/healthz` simply reports the live count for your
 monitoring stack to threshold.
 
-### Trusted / Commercial Endpoint Tuning
+### Trusted / Commercial Endpoint & Data-Plane Mocking Tuning
 
-When running `ethryx` against a fallback/secondary node or a commercial paid RPC provider (e.g., Alchemy, Infura, QuickNode), add `--trust-upstream` (`ETHRYX_TRUST_UPSTREAM`):
+When running `ethryx` against a fallback/secondary node or a commercial paid RPC provider (e.g., Alchemy, Infura, QuickNode):
 
-| Flag                | Default | Description                                                                 |
-|---------------------|---------|-----------------------------------------------------------------------------|
-| `--trust-upstream`  | `false` | Disable background health polling (0 RPC cost) and always report ready/200. |
+| Flag                                     | Default | Description                                                                 |
+|------------------------------------------|---------|-----------------------------------------------------------------------------|
+| `--trust-upstream`                       | `false` | Disable background health polling (0 RPC cost) and always report ready/200. |
+| `--mock-prepare-beacon-proposer`         | `false` | Intercept `POST /eth/v1/validator/prepare_beacon_proposer` with `200 OK`.   |
+| `--mock-beacon-committee-subscriptions`  | `false` | Intercept `POST /eth/v1/validator/beacon_committee_subscriptions` with `200 OK`. |
+| `--mock-sync-committee-subscriptions`    | `false` | Intercept `POST /eth/v1/validator/sync_committee_subscriptions` with `200 OK`. |
+| `--mock-eth-syncing`                     | `false` | Statically mock `eth_syncing` JSON-RPC (HTTP & WebSocket) with `result: false`. |
+| `--mock-cl-node-health`                  | `false` | Intercept `GET /eth/v1/node/health` locally with `200 OK`.                  |
+| `--cl-mev-relay-url`                     | `none`  | Optional upstream MEV Relay URL (`ETHRYX_CL_MEV_RELAY_URL`).                |
 
-When enabled, `ethryx` trusts the upstream node and skips background EL/CL health polling (consuming zero Compute Units / API credits on commercial providers) while continuing to proxy all incoming data-plane traffic normally.
+- **`--trust-upstream`**: When enabled, `ethryx` trusts the upstream node and skips background EL/CL health polling (consuming zero Compute Units / API credits on commercial providers).
+- **`--mock-prepare-beacon-proposer`**: Intercepts `POST /eth/v1/validator/prepare_beacon_proposer` requests (often sent periodically by SSV Node / Validator Clients) and returns `HTTP 200 OK` (`{"code":200,"message":"success"}`) locally, shielding against 400 errors from commercial providers that block write-only validator APIs.
+- **`--mock-beacon-committee-subscriptions`**: Intercepts `POST /eth/v1/validator/beacon_committee_subscriptions` attestation subnet subscription requests and returns `HTTP 200 OK` (`{"code":200,"message":"success"}`) locally.
+- **`--mock-sync-committee-subscriptions`**: Intercepts `POST /eth/v1/validator/sync_committee_subscriptions` sync committee subnet subscription requests and returns `HTTP 200 OK` (`{"code":200,"message":"success"}`) locally.
+- **`--mock-eth-syncing`**: Statically mocks `eth_syncing` JSON-RPC calls over HTTP POST and WebSocket frames locally (`result: false`), preventing unnecessary RPC credit consumption when downstream clients poll sync status.
+- **`--mock-cl-node-health`**: Intercepts `GET/HEAD /eth/v1/node/health` requests locally and returns `HTTP 200 OK` (Beacon API standard node health), shielding commercial providers from beacon node health probes.
+- **`--cl-mev-relay-url`**: When configured (e.g., `https://boost-relay-hoodi.flashbots.net`), `ethryx` intercepts `POST /eth/v1/validator/register_validator` requests from validator clients (such as SSV Node), rewrites the request path to `/eth/v1/builder/validators`, and forwards them directly to the specified MEV Relay.
 
 ## Development
 

@@ -1680,3 +1680,153 @@ async fn trust_upstream_mocks_eth_syncing_http_and_ws() {
 
     ethryx.shutdown().await;
 }
+
+#[tokio::test]
+async fn test_cl_mev_relay_routing() {
+    let el = MockServer::start(Arc::new(|_| (StatusCode::OK, b"{}".to_vec()))).await;
+    let cl = MockServer::start(Arc::new(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            b"{\"error\": \"Unsupported method\"}".to_vec(),
+        )
+    }))
+    .await;
+    let mev_relay = MockServer::start(Arc::new(|req| {
+        if req.path == "/eth/v1/builder/validators" && req.method == "POST" {
+            (StatusCode::OK, b"[]".to_vec())
+        } else {
+            (StatusCode::NOT_FOUND, b"not found".to_vec())
+        }
+    }))
+    .await;
+
+    let ethryx = EthryxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl.url,
+        "--cl-mev-relay-url",
+        &mev_relay.url,
+    ])
+    .await;
+
+    let c = client();
+    let (status, body) = post_json(
+        &c,
+        &ethryx.url("/eth/v1/validator/register_validator"),
+        json!([]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_ref(), b"[]");
+
+    ethryx.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_mock_prepare_beacon_proposer() {
+    let el = MockServer::start(Arc::new(|_| (StatusCode::OK, b"{}".to_vec()))).await;
+    let cl = MockServer::start(Arc::new(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            b"{\"error\": \"Unsupported method\"}".to_vec(),
+        )
+    }))
+    .await;
+
+    let ethryx = EthryxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl.url,
+        "--mock-prepare-beacon-proposer",
+    ])
+    .await;
+
+    let c = client();
+    let (status, body) = post_json(
+        &c,
+        &ethryx.url("/eth/v1/validator/prepare_beacon_proposer"),
+        json!([]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_ref(), b"{\"code\":200,\"message\":\"success\"}");
+
+    ethryx.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_mock_validator_subscriptions() {
+    let el = MockServer::start(Arc::new(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            b"should not be called".to_vec(),
+        )
+    }))
+    .await;
+    let cl = MockServer::start(Arc::new(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            b"should not be called".to_vec(),
+        )
+    }))
+    .await;
+
+    let ethryx = EthryxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl.url,
+        "--mock-beacon-committee-subscriptions",
+        "--mock-sync-committee-subscriptions",
+    ])
+    .await;
+
+    let c = client();
+    let (status, body) = post_json(
+        &c,
+        &ethryx.url("/eth/v1/validator/beacon_committee_subscriptions"),
+        json!([]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_ref(), b"{\"code\":200,\"message\":\"success\"}");
+
+    let (status2, body2) = post_json(
+        &c,
+        &ethryx.url("/eth/v1/validator/sync_committee_subscriptions"),
+        json!([]),
+    )
+    .await;
+    assert_eq!(status2, StatusCode::OK);
+    assert_eq!(body2.as_ref(), b"{\"code\":200,\"message\":\"success\"}");
+
+    ethryx.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_mock_eth_syncing_flag() {
+    let el = MockServer::start(Arc::new(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            b"should not be called".to_vec(),
+        )
+    }))
+    .await;
+
+    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--mock-eth-syncing"]).await;
+
+    let c = client();
+    let (status, body) = post_json(
+        &c,
+        &ethryx.url("/"),
+        json!({"jsonrpc": "2.0", "id": 1, "method": "eth_syncing", "params": []}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["result"], false);
+
+    ethryx.shutdown().await;
+}

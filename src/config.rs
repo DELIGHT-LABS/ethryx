@@ -68,6 +68,12 @@ pub struct Config {
     )]
     pub cl_beacon_url: String,
 
+    /// Optional Consensus-layer MEV Relay / MEV-Boost upstream URL (REST, /eth/v1/builder/validators).
+    /// When specified, POST /eth/v1/validator/register_validator requests are rewritten to
+    /// /eth/v1/builder/validators and routed to this URL.
+    #[arg(long, env = "ETHRYX_CL_MEV_RELAY_URL")]
+    pub cl_mev_relay_url: Option<String>,
+
     /// Beacon network. Selects defaults for cl-genesis-time / cl-seconds-per-slot.
     /// Use `custom` for private chains and pass both values explicitly.
     #[arg(long, env = "ETHRYX_NETWORK", value_enum, default_value_t = Network::Mainnet)]
@@ -149,6 +155,61 @@ pub struct Config {
         default_missing_value = "true"
     )]
     pub trust_upstream: bool,
+
+    /// Statically mock eth_syncing JSON-RPC requests (HTTP & WebSocket) locally with result: false.
+    #[arg(
+        long,
+        env = "ETHRYX_MOCK_ETH_SYNCING",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub mock_eth_syncing: bool,
+
+    /// Statically mock POST /eth/v1/validator/prepare_beacon_proposer requests locally with 200 OK.
+    #[arg(
+        long,
+        env = "ETHRYX_MOCK_PREPARE_BEACON_PROPOSER",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub mock_prepare_beacon_proposer: bool,
+
+    /// Statically mock POST /eth/v1/validator/beacon_committee_subscriptions requests locally with 200 OK.
+    #[arg(
+        long,
+        env = "ETHRYX_MOCK_BEACON_COMMITTEE_SUBSCRIPTIONS",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub mock_beacon_committee_subscriptions: bool,
+
+    /// Statically mock POST /eth/v1/validator/sync_committee_subscriptions requests locally with 200 OK.
+    #[arg(
+        long,
+        env = "ETHRYX_MOCK_SYNC_COMMITTEE_SUBSCRIPTIONS",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub mock_sync_committee_subscriptions: bool,
+
+    /// Statically mock GET /eth/v1/node/health requests locally with 200 OK.
+    #[arg(
+        long,
+        env = "ETHRYX_MOCK_CL_NODE_HEALTH",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub mock_cl_node_health: bool,
 
     /// Upstream timeout for proxied requests (seconds).
     #[arg(long, env = "ETHRYX_PROXY_TIMEOUT", default_value = "60", value_parser = parse_secs)]

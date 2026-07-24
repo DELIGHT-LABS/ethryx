@@ -122,9 +122,62 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
     {
         return Ok(health::node_health(state));
     }
+    if req.method() == Method::POST
+        && req.uri().path() == "/eth/v1/validator/prepare_beacon_proposer"
+        && state.cfg.mock_prepare_beacon_proposer
+    {
+        let res = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(box_full(Full::new(Bytes::from_static(
+                b"{\"code\":200,\"message\":\"success\"}",
+            ))))
+            .unwrap();
+        return Ok(res);
+    }
+    if req.method() == Method::POST
+        && req.uri().path() == "/eth/v1/validator/beacon_committee_subscriptions"
+        && state.cfg.mock_beacon_committee_subscriptions
+    {
+        let res = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(box_full(Full::new(Bytes::from_static(
+                b"{\"code\":200,\"message\":\"success\"}",
+            ))))
+            .unwrap();
+        return Ok(res);
+    }
+    if req.method() == Method::POST
+        && req.uri().path() == "/eth/v1/validator/sync_committee_subscriptions"
+        && state.cfg.mock_sync_committee_subscriptions
+    {
+        let res = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(box_full(Full::new(Bytes::from_static(
+                b"{\"code\":200,\"message\":\"success\"}",
+            ))))
+            .unwrap();
+        return Ok(res);
+    }
+    if req.method() == Method::POST
+        && req.uri().path() == "/eth/v1/validator/register_validator"
+        && let Some(ref mev_url) = state.cfg.cl_mev_relay_url
+    {
+        return http_proxy_with_path(
+            req,
+            state,
+            mev_url,
+            Some("/eth/v1/builder/validators"),
+            &state.client,
+        )
+        .await;
+    }
     if is_cl_path(req.uri().path()) {
         return http_proxy(req, state, &state.cfg.cl_beacon_url, &state.client).await;
     }
+    let mock_ws = state.cfg.mock_eth_syncing || state.cfg.trust_upstream;
     // HTTP/2 Extended CONNECT WebSocket (RFC 8441): :method=CONNECT, :protocol=websocket.
     if req.method() == Method::CONNECT
         && req
@@ -136,7 +189,7 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
             req,
             state.cfg.el_ws_url.clone(),
             state.cfg.proxy_timeout,
-            state.cfg.trust_upstream,
+            mock_ws,
         )
         .await;
     }
@@ -146,7 +199,7 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
             req,
             state.cfg.el_ws_url.clone(),
             state.cfg.proxy_timeout,
-            state.cfg.trust_upstream,
+            mock_ws,
         )
         .await;
     }
@@ -158,7 +211,10 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
         &state.client
     };
 
-    if req.method() == Method::POST && !is_cl_path(req.uri().path()) && state.cfg.trust_upstream {
+    if req.method() == Method::POST
+        && !is_cl_path(req.uri().path())
+        && (state.cfg.mock_eth_syncing || state.cfg.trust_upstream)
+    {
         let (parts, body) = req.into_parts();
         match http_body_util::BodyExt::collect(body).await {
             Ok(collected) => {
@@ -251,10 +307,11 @@ fn try_mock_ws_eth_syncing(text: &str) -> Option<String> {
     None
 }
 
-async fn http_proxy<B>(
+async fn http_proxy_with_path<B>(
     req: Request<B>,
     state: &AppState,
     upstream_base: &str,
+    override_path: Option<&str>,
     client: &ProxyClient,
 ) -> Result<Response<ResBody>, BoxError>
 where
@@ -264,9 +321,19 @@ where
     let (mut parts, body) = req.into_parts();
     #[cfg(feature = "otel")]
     crate::otel::propagate_context(&mut parts.headers);
-    let upstream_uri: Uri = {
-        let pq = parts.uri.path_and_query().map_or("/", |p| p.as_str());
-        format!("{}{}", upstream_base.trim_end_matches('/'), pq).parse()?
+    let upstream_uri: Uri = match override_path {
+        Some(new_path) => {
+            let base = upstream_base.trim_end_matches('/');
+            if let Some(query) = parts.uri.query() {
+                format!("{base}{new_path}?{query}").parse()?
+            } else {
+                format!("{base}{new_path}").parse()?
+            }
+        }
+        None => {
+            let pq = parts.uri.path_and_query().map_or("/", |p| p.as_str());
+            format!("{}{}", upstream_base.trim_end_matches('/'), pq).parse()?
+        }
     };
     parts.uri = upstream_uri;
     strip_hop_by_hop(&mut parts.headers);
@@ -284,6 +351,19 @@ where
     let (mut resp_parts, resp_body) = resp.into_parts();
     strip_hop_by_hop(&mut resp_parts.headers);
     Ok(Response::from_parts(resp_parts, box_incoming(resp_body)))
+}
+
+async fn http_proxy<B>(
+    req: Request<B>,
+    state: &AppState,
+    upstream_base: &str,
+    client: &ProxyClient,
+) -> Result<Response<ResBody>, BoxError>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<BoxError>,
+{
+    http_proxy_with_path(req, state, upstream_base, None, client).await
 }
 
 fn build_ws_request(req: &Request<Incoming>, upstream_url: &str) -> Result<Request<()>, BoxError> {

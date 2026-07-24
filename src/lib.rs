@@ -120,6 +120,9 @@ where
     let cl_base = cfg.cl_beacon_url.trim_end_matches('/');
     let cl_syncing_uri = format!("{cl_base}/eth/v1/node/syncing").parse()?;
     let cl_peer_count_uri = format!("{cl_base}/eth/v1/node/peer_count").parse()?;
+    if let Some(ref mev_url) = cfg.cl_mev_relay_url {
+        let _: http::Uri = mev_url.parse()?;
+    }
     let cl_genesis_time = cfg.resolve_cl_genesis_time()?;
     let cl_seconds_per_slot = cfg.resolve_cl_seconds_per_slot()?;
     let poll_interval = cfg.health_poll_interval;
@@ -153,11 +156,13 @@ where
     } else {
         "HTTP/1.1"
     };
+    let mev_relay_log = state.cfg.cl_mev_relay_url.as_deref().unwrap_or("none");
     info!(
         el_http = %state.cfg.el_http_url,
         el_http_proto = %el_proto,
         el_ws = %state.cfg.el_ws_url,
         cl_beacon = %state.cfg.cl_beacon_url,
+        cl_mev_relay = %mev_relay_log,
         cl_proto = "HTTP/1.1",
         "upstreams connected"
     );
