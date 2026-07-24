@@ -6,7 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 <!-- next-header -->
-## [Unreleased] - ReleaseDate
+## [0.2.4] - 2026-07-23
+
+### Added
+
+- Added single consolidated `--mock-cl-subscriptions` (`ETHRYX_MOCK_CL_SUBSCRIPTIONS`) flag to intercept `prepare_beacon_proposer`, `beacon_committee_subscriptions`, and `sync_committee_subscriptions` requests locally with `200 OK`. Replaced the previous 3 individual flags.
+- Added `--cl-mev-relay-url` (`ETHRYX_CL_MEV_RELAY_URL`) option to rewrite `POST /eth/v1/validator/register_validator` requests to `/eth/v1/builder/validators` and proxy directly to an upstream MEV Relay.
+- Added `--mock-eth-syncing` (`ETHRYX_MOCK_ETH_SYNCING`) and `--mock-cl-node-health` (`ETHRYX_MOCK_CL_NODE_HEALTH`) flags to intercept `eth_syncing` JSON-RPC and `GET /eth/v1/node/health` requests locally, decoupled from `--trust-upstream`.
+
+### Changed
+
+- Optimized hop-by-hop header removal using static `HeaderName` constants to eliminate per-request header name string parsing.
+
+### Fixed
+
+- Preserved upstream URI path components without appending unnecessary trailing slashes (`/`) during root request proxying and WebSocket handshakes, preventing HTTP 400 `Unsupported method: /` errors from commercial RPC providers (Alchemy).
 
 ## [0.2.2] - 2026-07-03
 
