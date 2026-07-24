@@ -6,7 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 <!-- next-header -->
-## [Unreleased] - ReleaseDate
+## [0.2.4] - 2026-07-23
+
+### Added
+
+- Added explicit pinpoint data-plane mocking flags (`--mock-prepare-beacon-proposer`, `--mock-beacon-committee-subscriptions`, `--mock-sync-committee-subscriptions`, `--mock-eth-syncing`, `--mock-cl-node-health`) to intercept and shield unsupported validator API requests locally.
+- Added `--cl-mev-relay-url` (`ETHRYX_CL_MEV_RELAY_URL`) option to rewrite `POST /eth/v1/validator/register_validator` requests to `/eth/v1/builder/validators` and proxy directly to an upstream MEV Relay.
+- Static mocking for `eth_syncing` JSON-RPC requests over HTTP POST and WebSocket frames when `--trust-upstream` flag is enabled.
+
+### Changed
+
+- Optimized hop-by-hop header removal using static `HeaderName` constants to eliminate per-request header name string parsing.
+
+### Fixed
+
+- Preserved upstream URI path components without appending unnecessary trailing slashes (`/`) during root request proxying and WebSocket handshakes, preventing HTTP 400 `Unsupported method: /` errors from commercial RPC providers (Alchemy).
 
 ## [0.2.2] - 2026-07-03
 
