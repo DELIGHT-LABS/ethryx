@@ -1,6 +1,6 @@
 [package]
 name = "ethryx"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 rust-version = "1.95"
 description = "Lightweight Rust reverse proxy and health-check sidecar for Ethereum EL/CL nodes."
