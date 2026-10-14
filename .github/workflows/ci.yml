@@ -18,8 +18,12 @@ permissions:
 
 jobs:
   build:
-    name: Build & test
-    runs-on: ubuntu-latest
+    name: Build & test (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest, windows-latest]
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -38,6 +42,12 @@ jobs:
 
       - name: cargo test
         run: cargo test --locked
+
+      - name: cargo clippy (all features)
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: cargo test (all features)
+        run: cargo test --all-features --locked
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
@@ -141,3 +151,6 @@ jobs:
 
       - name: cargo build --release --target ${{ matrix.target }}
         run: cargo build --release --target ${{ matrix.target }} --locked
+
+      - name: cargo build --release --all-features --target ${{ matrix.target }}
+        run: cargo build --release --all-features --target ${{ matrix.target }} --locked

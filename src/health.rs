@@ -6,7 +6,6 @@ use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
 use serde::Serialize;
-use serde_json::Value;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
@@ -89,9 +88,11 @@ pub struct ReadyReport {
     pub cl_slot_fresh: Option<Check>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize)]
 struct ClStatus {
+    #[serde(deserialize_with = "decimal_string")]
     head_slot: u64,
+    #[serde(deserialize_with = "decimal_string")]
     sync_distance: u64,
     is_syncing: bool,
 }
@@ -788,20 +789,22 @@ async fn fetch_bytes(
     req: Request<ResBody>,
     client: &ProxyClient,
 ) -> Result<Bytes, HealthError> {
-    let resp = tokio::time::timeout(state.cfg.health_timeout, client.request(req))
-        .await
-        .map_err(|_| HealthError::Timeout)?
-        .map_err(|e| HealthError::Transport(e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err(HealthError::HttpStatus(resp.status()));
-    }
-    let body = resp.into_body();
-    let limited = http_body_util::Limited::new(body, 10 * 1024 * 1024);
-    limited
-        .collect()
-        .await
-        .map(|c| c.to_bytes())
-        .map_err(|e| HealthError::Decode(e.to_string()))
+    tokio::time::timeout(state.cfg.health_timeout, async {
+        let resp = client
+            .request(req)
+            .await
+            .map_err(|e| HealthError::Transport(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(HealthError::HttpStatus(resp.status()));
+        }
+        http_body_util::Limited::new(resp.into_body(), 10 * 1024 * 1024)
+            .collect()
+            .await
+            .map(|c| c.to_bytes())
+            .map_err(|e| HealthError::Decode(e.to_string()))
+    })
+    .await
+    .map_err(|_| HealthError::Timeout)?
 }
 
 async fn el_batch_rpc(
@@ -809,13 +812,6 @@ async fn el_batch_rpc(
     payload: Bytes,
     client: &ProxyClient,
 ) -> Result<ElBatchResult, HealthError> {
-    #[derive(serde::Deserialize)]
-    struct RpcResponse {
-        id: i64,
-        result: Option<Box<serde_json::value::RawValue>>,
-        error: Option<serde_json::Value>,
-    }
-
     let req = Request::builder()
         .method(Method::POST)
         .uri(state.el_http_uri.clone())
@@ -823,8 +819,21 @@ async fn el_batch_rpc(
         .body(box_full(Full::new(payload)))
         .map_err(|e| HealthError::Transport(format!("build: {e}")))?;
     let body = fetch_bytes(state, req, client).await?;
-    let mut arr: Vec<RpcResponse> =
-        serde_json::from_slice(&body).map_err(|e| HealthError::Decode(e.to_string()))?;
+    parse_el_batch(&body)
+}
+
+fn parse_el_batch(body: &[u8]) -> Result<ElBatchResult, HealthError> {
+    #[derive(serde::Deserialize)]
+    struct RpcResponse<'a> {
+        id: i64,
+        #[serde(borrow)]
+        result: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow)]
+        error: Option<&'a serde_json::value::RawValue>,
+    }
+
+    let arr: Vec<RpcResponse<'_>> =
+        serde_json::from_slice(body).map_err(|e| HealthError::Decode(e.to_string()))?;
 
     if arr.len() != 3 {
         return Err(HealthError::Decode(format!(
@@ -833,17 +842,22 @@ async fn el_batch_rpc(
         )));
     }
 
-    let mut parse_res = |id_val: i64| -> Result<Box<serde_json::value::RawValue>, HealthError> {
-        let idx = arr
+    if arr.iter().any(|res| !(1..=3).contains(&res.id))
+        || (1..=3).any(|id| arr.iter().filter(|res| res.id == id).count() != 1)
+    {
+        return Err(HealthError::Decode(
+            "duplicate or unexpected response id".into(),
+        ));
+    }
+    let parse_res = |id_val: i64| -> Result<&serde_json::value::RawValue, HealthError> {
+        let resp = arr
             .iter()
-            .position(|res| res.id == id_val)
+            .find(|res| res.id == id_val)
             .ok_or_else(|| HealthError::Decode(format!("missing response for id {id_val}")))?;
-        let mut resp = arr.remove(idx);
-        if let Some(err) = resp.error.take() {
-            return Err(HealthError::Rpc(err.to_string()));
+        if let Some(err) = resp.error {
+            return Err(HealthError::Rpc(err.get().to_owned()));
         }
         resp.result
-            .take()
             .ok_or_else(|| HealthError::Decode("missing result".into()))
     };
 
@@ -864,44 +878,54 @@ async fn el_batch_rpc(
     })
 }
 
+#[derive(serde::Deserialize)]
+struct ClEnvelope<T> {
+    data: T,
+}
+
+fn decimal_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    struct Decimal;
+    impl serde::de::Visitor<'_> for Decimal {
+        type Value = u64;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an unsigned decimal string")
+        }
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<u64, E> {
+            value.parse().map_err(E::custom)
+        }
+    }
+    deserializer.deserialize_str(Decimal)
+}
+
 async fn cl_syncing_status(state: &AppState) -> Result<ClStatus, String> {
-    let v = cl_get_json(state, &state.cl_syncing_uri).await?;
-    let data = v.get("data").ok_or("missing data")?;
-    let is_syncing = data
-        .get("is_syncing")
-        .and_then(Value::as_bool)
-        .ok_or("missing is_syncing")?;
-    let head_slot = parse_decimal_str(data.get("head_slot")).ok_or("missing head_slot")?;
-    let sync_distance =
-        parse_decimal_str(data.get("sync_distance")).ok_or("missing sync_distance")?;
-    Ok(ClStatus {
-        head_slot,
-        sync_distance,
-        is_syncing,
-    })
+    cl_get_json(state, &state.cl_syncing_uri).await
 }
 
 async fn cl_peer_count(state: &AppState) -> Result<u64, String> {
-    let v = cl_get_json(state, &state.cl_peer_count_uri).await?;
-    let data = v.get("data").ok_or("missing data")?;
-    parse_decimal_str(data.get("connected")).ok_or_else(|| "missing connected".into())
+    #[derive(serde::Deserialize)]
+    struct Peers {
+        #[serde(deserialize_with = "decimal_string")]
+        connected: u64,
+    }
+    let peers: Peers = cl_get_json(state, &state.cl_peer_count_uri).await?;
+    Ok(peers.connected)
 }
 
-async fn cl_get_json(state: &AppState, uri: &Uri) -> Result<Value, String> {
+async fn cl_get_json<T: serde::de::DeserializeOwned>(
+    state: &AppState,
+    uri: &Uri,
+) -> Result<T, String> {
     let req = Request::builder()
         .method(Method::GET)
         .uri(uri.clone())
         .body(box_full(Full::new(Bytes::new())))
-        .map_err(|e| format!("build: {e}"))?;
+        .map_err(|e| e.to_string())?;
     let body = fetch_bytes(state, req, &state.client)
         .await
         .map_err(|e| e.to_string())?;
-    serde_json::from_slice(&body).map_err(|e| format!("decode: {e}"))
-}
-
-fn parse_decimal_str(v: Option<&Value>) -> Option<u64> {
-    v.and_then(Value::as_str)
-        .and_then(|s| s.parse::<u64>().ok())
+    serde_json::from_slice::<ClEnvelope<T>>(&body)
+        .map(|v| v.data)
+        .map_err(|e| format!("decode: {e}"))
 }
 
 fn hex_to_u64(s: &str) -> Option<u64> {
@@ -918,7 +942,37 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+
+    #[test]
+    fn el_batch_matches_ids_in_any_order_and_keeps_partial_results() {
+        let parsed = parse_el_batch(br#"[{"id":3,"result":{"number":"0x42","timestamp":"0x43"}},{"id":1,"result":false},{"id":2,"error":{"code":-32000,"message":"unavailable"}}]"#).unwrap();
+        assert_eq!(parsed.syncing.unwrap(), ElSyncingResult::Synced(false));
+        assert_eq!(parsed.block.unwrap().number, "0x42");
+        assert!(matches!(parsed.peers, Err(HealthError::Rpc(_))));
+    }
+
+    #[test]
+    fn el_batch_rejects_ambiguous_ids_and_invalid_results() {
+        for input in [
+            r#"[]"#,
+            r#"[{"id":1,"result":false},{"id":1,"result":false},{"id":3,"result":null}]"#,
+            r#"[{"id":1,"result":false},{"id":2,"result":"0x1"},{"id":4,"result":null}]"#,
+            r#"[{"id":"1","result":false},{"id":2,"result":"0x1"},{"id":3,"result":null}]"#,
+        ] {
+            assert!(
+                matches!(
+                    parse_el_batch(input.as_bytes()),
+                    Err(HealthError::Decode(_))
+                ),
+                "{input}"
+            );
+        }
+        let parsed =
+            parse_el_batch(br#"[{"id":1,"result":null},{"id":2},{"id":3,"result":{}}]"#).unwrap();
+        assert!(parsed.syncing.is_err());
+        assert!(parsed.peers.is_err());
+        assert!(parsed.block.is_err());
+    }
 
     #[test]
     fn hex_with_0x_prefix() {
@@ -946,32 +1000,31 @@ mod tests {
     }
 
     #[test]
-    fn decimal_str_parses_beacon_format() {
-        let v = json!("9412341");
-        assert_eq!(parse_decimal_str(Some(&v)), Some(9_412_341));
-    }
-
-    #[test]
-    fn decimal_str_rejects_numeric_json() {
-        let v = json!(42);
-        assert_eq!(parse_decimal_str(Some(&v)), None);
-    }
-
-    #[test]
-    fn decimal_str_handles_missing_field() {
-        assert_eq!(parse_decimal_str(None), None);
-    }
-
-    #[test]
-    fn decimal_str_rejects_garbage_string() {
-        let v = json!("not a number");
-        assert_eq!(parse_decimal_str(Some(&v)), None);
-    }
-
-    #[test]
-    fn decimal_str_handles_zero() {
-        let v = json!("0");
-        assert_eq!(parse_decimal_str(Some(&v)), Some(0));
+    fn typed_beacon_response_preserves_decimal_semantics() {
+        let response: ClEnvelope<ClStatus> = serde_json::from_str(r#"{"data":{"head_slot":"9412341","sync_distance":"0","is_syncing":false,"extra":{"ignored":true}}}"#).unwrap();
+        assert_eq!(response.data.head_slot, 9_412_341);
+        assert_eq!(response.data.sync_distance, 0);
+        for value in [
+            "42",
+            "null",
+            r#""invalid""#,
+            r#""-1""#,
+            r#""18446744073709551616""#,
+        ] {
+            let text = format!(
+                r#"{{"data":{{"head_slot":{value},"sync_distance":"0","is_syncing":false}}}}"#
+            );
+            assert!(
+                serde_json::from_str::<ClEnvelope<ClStatus>>(&text).is_err(),
+                "{text}"
+            );
+        }
+        assert!(
+            serde_json::from_str::<ClEnvelope<ClStatus>>(
+                r#"{"data":{"sync_distance":"0","is_syncing":false}}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

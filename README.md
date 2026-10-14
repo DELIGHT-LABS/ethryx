@@ -91,7 +91,7 @@ instead of typing both; `--cl-genesis-time 0` omits `cl.slot_age_secs`.
 
 `/readyz` and `/healthz` don't query upstream per request. A background task
 polls all signals, then waits `--health-poll-interval` (default 1s; each call
-bounded by `--health-timeout`) before the next poll, and the endpoints return
+bounded by `--health-timeout`, including the response body) before the next poll, and the endpoints return
 the latest snapshot instantly — so upstream load is constant regardless of probe
 rate, a slow upstream never blocks a probe, and the poller pauses a full interval
 between polls rather than hammering a struggling node. Block / slot ages are
@@ -126,6 +126,12 @@ HTTP/1.1 WebSocket upgrade are unchanged.
 WebSocket works over both transports: the HTTP/1.1 `Upgrade` handshake and
 HTTP/2 Extended CONNECT (RFC 8441, `:protocol=websocket`). Either is bridged to
 the upstream's HTTP/1.1 WebSocket (`--el-ws-url`).
+
+Subprotocol selection is relayed from the upstream. Frames remain limited to
+16 MiB and complete messages to 64 MiB, including fragmented messages. The
+relay uses 8 KiB read buffers that grow for larger frames and 16 KiB write
+buffers; ordinary forwarding needs no additional shared sink mutex. Tungstenite
+continues to validate masking, UTF-8, control frames, and upstream handshakes.
 
 The upstream client auto-negotiates h2 for `https://` upstreams via ALPN. A
 cleartext EL JSON-RPC upstream can't be auto-negotiated, so the health poller
@@ -245,6 +251,11 @@ The following metrics are exposed:
 
 If built with the `otel` feature, ethryx supports exporting traces and metrics to an OTLP endpoint (HTTP protocol).
 
+Pass an HTTP(S) **base URL**, optionally with a path prefix and without a query or fragment.
+Ethryx appends `/v1/traces` and `/v1/metrics` for the respective signals. The
+exporters use Rustls and run their blocking work outside Tokio workers. Both
+providers flush on orderly shutdown (Ctrl-C, or SIGTERM on Unix).
+
 ```sh
 # Build with OpenTelemetry support
 cargo build --features otel
@@ -321,6 +332,17 @@ When running `ethryx` against a fallback/secondary node or a commercial paid RPC
 - **`--mock-eth-syncing`**: Intercepts `eth_syncing` JSON-RPC calls over HTTP POST and WebSocket frames locally (`result: false`), shielding commercial providers from downstream client sync polls.
 - **`--mock-cl-node-health`**: Intercepts `GET/HEAD /eth/v1/node/health` requests locally and returns `HTTP 200 OK` (Beacon API standard node health), shielding commercial providers from beacon node health probes.
 - **`--cl-mev-relay-url`**: When configured (e.g., `https://boost-relay-hoodi.flashbots.net`), `ethryx` intercepts `POST /eth/v1/validator/register_validator` requests from validator clients (such as SSV Node), rewrites the request path to `/eth/v1/builder/validators`, and forwards them directly to the specified MEV Relay.
+
+With `--trust-upstream`, cleartext HTTP uses HTTP/1.1 because health-based h2c
+detection is disabled; HTTPS still negotiates via ALPN. Data-plane requests are
+never retried across protocols.
+
+The `eth_syncing` mock handles JSON-RPC 2.0 calls and entirely local batches.
+Notifications (no `id`) produce HTTP `204` or no WebSocket message; explicit
+`id: null` still receives a reply. Mixed batches and invalid requests are
+forwarded intact. HTTP POST bodies inspected by this opt-in mock are limited to
+64 MiB (`413` on overflow) and `--proxy-timeout` (`408` on a stalled body).
+Ordinary HTTP forwarding continues to stream bodies.
 
 ## Development
 

@@ -13,7 +13,9 @@ pub mod metrics;
 #[cfg(feature = "otel")]
 pub mod otel;
 mod proxy;
+mod rpc;
 mod state;
+mod websocket;
 
 pub use config::Config;
 
@@ -45,6 +47,38 @@ pub async fn run<F>(cfg: Config, shutdown: F) -> Result<(), BoxError>
 where
     F: Future<Output = ()> + Send,
 {
+    #[cfg(feature = "otel")]
+    let telemetry = crate::otel::start(cfg.otel_endpoint.as_deref()).await?;
+    run_inner(
+        cfg,
+        shutdown,
+        #[cfg(feature = "otel")]
+        telemetry,
+    )
+    .await
+}
+
+/// Run with providers initialized before the caller constructs its tracing layer.
+#[cfg(feature = "otel")]
+pub async fn run_with_telemetry<F>(
+    cfg: Config,
+    shutdown: F,
+    telemetry: Option<otel::Telemetry>,
+) -> Result<(), BoxError>
+where
+    F: Future<Output = ()> + Send,
+{
+    run_inner(cfg, shutdown, telemetry).await
+}
+
+async fn run_inner<F>(
+    cfg: Config,
+    shutdown: F,
+    #[cfg(feature = "otel")] telemetry: Option<otel::Telemetry>,
+) -> Result<(), BoxError>
+where
+    F: Future<Output = ()> + Send,
+{
     // Install default rustls cryptoprovider to prevent panics during parallel tests
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
@@ -53,8 +87,7 @@ where
     let prometheus_handle = prometheus_recorder.handle();
 
     #[cfg(feature = "otel")]
-    let _otel_guard = if let Some(ref otel_endpoint) = cfg.otel_endpoint {
-        let tp = crate::otel::init_otel(otel_endpoint)?;
+    let _otel_guard = if let Some(telemetry) = telemetry {
         let otel_recorder = crate::otel::OtelRecorder::new();
         let fanout = metrics_util::layers::FanoutBuilder::default()
             .add_recorder(prometheus_recorder)
@@ -70,7 +103,7 @@ where
                 }
             });
         }
-        Some(tp)
+        Some(telemetry)
     } else {
         if ::metrics::set_global_recorder(prometheus_recorder).is_ok() {
             let _ = PROMETHEUS_HANDLE.set(prometheus_handle.clone());
@@ -132,11 +165,12 @@ where
     let (probe_tx, probe_rx) = watch::channel(Arc::new(health::Probe::pending()));
     let (shutdown_tx, _) = watch::channel(false);
 
+    let prefer_h2 = !cfg.trust_upstream;
     let state = Arc::new(AppState {
         cfg,
         client,
         el_h2_client,
-        el_use_h2: AtomicBool::new(true),
+        el_use_h2: AtomicBool::new(prefer_h2),
         el_http_uri,
         cl_syncing_uri,
         cl_peer_count_uri,
@@ -221,7 +255,7 @@ where
     }
     #[cfg(feature = "otel")]
     if let Some(tp) = _otel_guard {
-        let _ = tp.shutdown();
+        tp.shutdown().await;
     }
     Ok(())
 }
