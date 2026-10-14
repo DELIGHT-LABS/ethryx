@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Include project license texts, dependency license notices, and Rust library notices in every release binary archive, with verification before upload.
 - Add default/all-feature CI checks on Linux, macOS and Windows.
+- Verify actual default/all-feature release archives for all four targets in CI, with regression tests for missing, empty and altered license files.
 - Add seeded million-input JSON differential stress and sustained WebSocket churn checks.
 
 ### Changed
@@ -26,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Separate release build caches by target to prevent native host build scripts from failing against the cross image's older glibc.
 - Generate license reports through an explicit UTF-8 file so Windows PowerShell releases do not fail on cargo-about's redirected-output guard.
 - Preserve WebSocket subprotocol selection across split header lines, strip hop-by-hop and `Connection`-nominated headers before restoring canonical upstream handshake headers, and apply bounded close-handshake draining to both standard and mocked relays. Decline unsupported extensions and reject unsolicited extension or ambiguous subprotocol responses.
 - Separate base path joining from query merging when constructing upstream URIs so query-authenticated base URLs preserve both paths and queries.
