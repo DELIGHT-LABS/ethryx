@@ -390,6 +390,25 @@ Common tasks (via `just`):
 Open in a devcontainer (VSCode / Codespaces) and `.devcontainer/devcontainer.json`
 installs all of the above plus the cross-compile targets automatically.
 
+### Extended validation
+
+Run the longer correctness checks explicitly:
+
+```sh
+cargo test --release --locked --lib rpc::tests::prefilter_seeded_stress_matches_full_parser \
+  -- --ignored --exact
+ETHRYX_STRESS_SECONDS=60 cargo test --release --locked --test integration \
+  websocket_sustained_churn_preserves_replies_and_releases_upstreams \
+  -- --ignored --exact --nocapture
+```
+
+The JSON check compares one million deterministic inputs with the full parser.
+The WebSocket check uses 16 concurrent clients, orderly and abrupt disconnects,
+binary messages, notifications and mock/forwarded calls; the duration applies
+to each of the two mock modes. It verifies that all upstream connections are
+released. CI runs the JSON check and a shorter five-second-per-mode churn check
+on Linux, macOS and Windows.
+
 ## Release
 
 Releases are cut with [`cargo-release`](https://github.com/crate-ci/cargo-release):
@@ -438,7 +457,10 @@ python3 scripts/generate-licenses.py --target x86_64-unknown-linux-musl
 
 Generated files live in `target/release-licenses/` and are not checked in.
 `about.toml` controls accepted licenses; keep it aligned with `deny.toml`.
-CI checks both default and all features for every release target. Build
+CI builds and verifies actual archives with both default and all features for
+every release target, using the same packaging action as releases. Run the
+archive verifier's missing/altered-file regression tests with
+`python3 -m unittest discover -s scripts -p 'test_*.py'`. Build
 dependencies and complete upstream license bundles are retained conservatively,
 so notices can include code that the final binary does not use. When changing
 Rust or the native toolchain, also review [the musl notice](licenses/README.md).
