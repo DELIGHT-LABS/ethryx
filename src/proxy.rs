@@ -4,13 +4,11 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
 use http::{Method, Request, Response, StatusCode, Uri, Version};
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use tokio_tungstenite::tungstenite::protocol::Role;
+use hyper_util::rt::TokioExecutor;
 use tracing::{debug, trace};
 
 use crate::headers::strip_hop_by_hop;
@@ -165,7 +163,7 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
             .get::<hyper::ext::Protocol>()
             .is_some_and(|p| p.as_str() == "websocket")
     {
-        return ws_upgrade_h2(
+        return crate::websocket::upgrade(
             req,
             state.cfg.el_ws_url.clone(),
             state.cfg.proxy_timeout,
@@ -174,8 +172,8 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
         .await;
     }
     // HTTP/1.1 Upgrade WebSocket.
-    if hyper_tungstenite::is_upgrade_request(&req) {
-        return ws_upgrade(
+    if crate::websocket::is_upgrade_request(&req) {
+        return crate::websocket::upgrade(
             req,
             state.cfg.el_ws_url.clone(),
             state.cfg.proxy_timeout,
@@ -191,10 +189,15 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
         &state.client
     };
 
-    if req.method() == Method::POST && !is_cl_path(req.uri().path()) && state.cfg.mock_eth_syncing {
+    if req.method() == Method::POST && state.cfg.mock_eth_syncing {
         let (parts, body) = req.into_parts();
-        match http_body_util::BodyExt::collect(body).await {
-            Ok(collected) => {
+        let collected = tokio::time::timeout(
+            state.cfg.proxy_timeout,
+            http_body_util::Limited::new(body, 64 * 1024 * 1024).collect(),
+        )
+        .await;
+        match collected {
+            Ok(Ok(collected)) => {
                 let bytes = collected.to_bytes();
                 if let Some(mock_res) = try_mock_eth_syncing(&bytes) {
                     return Ok(mock_res);
@@ -202,10 +205,20 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
                 let req = Request::from_parts(parts, box_full(Full::new(bytes)));
                 return http_proxy(req, state, &state.cfg.el_http_url, el_client).await;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 return Ok(text_response(
-                    StatusCode::BAD_REQUEST,
+                    if e.is::<http_body_util::LengthLimitError>() {
+                        StatusCode::PAYLOAD_TOO_LARGE
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    },
                     format!("failed to read request body: {e}"),
+                ));
+            }
+            Err(_) => {
+                return Ok(text_response(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "request body timed out",
                 ));
             }
         }
@@ -215,73 +228,25 @@ async fn route(req: Request<Incoming>, state: &AppState) -> Result<Response<ResB
 }
 
 fn try_mock_eth_syncing(bytes: &[u8]) -> Option<Response<ResBody>> {
-    if !bytes.windows(11).any(|w| w == b"eth_syncing") {
-        return None;
-    }
-
-    #[derive(serde::Deserialize)]
-    struct RpcReq<'a> {
-        method: Option<&'a str>,
-        #[serde(borrow)]
-        id: Option<&'a serde_json::value::RawValue>,
-    }
-
-    if let Ok(req) = serde_json::from_slice::<RpcReq>(bytes) {
-        if req.method == Some("eth_syncing") {
-            let id_str = req.id.map(|v| v.get()).unwrap_or("null");
-            let body = format!(r#"{{"jsonrpc":"2.0","id":{},"result":false}}"#, id_str);
-            let res = Response::builder()
+    match crate::rpc::mock_syncing(bytes) {
+        crate::rpc::MockResult::Forward => None,
+        crate::rpc::MockResult::Silent => Some(text_response(StatusCode::NO_CONTENT, Bytes::new())),
+        crate::rpc::MockResult::Reply(body) => Some(
+            Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
                 .body(box_full(Full::new(Bytes::from(body))))
-                .unwrap();
-            return Some(res);
-        }
-    } else if let Ok(reqs) = serde_json::from_slice::<Vec<RpcReq>>(bytes)
-        && !reqs.is_empty()
-        && reqs.iter().all(|r| r.method == Some("eth_syncing"))
-    {
-        let mut items = Vec::with_capacity(reqs.len());
-        for r in reqs {
-            let id_str = r.id.map(|v| v.get()).unwrap_or("null");
-            items.push(format!(
-                r#"{{"jsonrpc":"2.0","id":{},"result":false}}"#,
-                id_str
-            ));
-        }
-        let body = format!("[{}]", items.join(","));
-        let res = Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "application/json")
-            .body(box_full(Full::new(Bytes::from(body))))
-            .unwrap();
-        return Some(res);
+                .unwrap(),
+        ),
     }
-    None
 }
 
+#[cfg(test)]
 fn try_mock_ws_eth_syncing(text: &str) -> Option<String> {
-    if !text.contains("eth_syncing") {
-        return None;
+    match crate::rpc::mock_syncing(text.as_bytes()) {
+        crate::rpc::MockResult::Reply(body) => Some(body),
+        _ => None,
     }
-
-    #[derive(serde::Deserialize)]
-    struct RpcReq<'a> {
-        method: Option<&'a str>,
-        #[serde(borrow)]
-        id: Option<&'a serde_json::value::RawValue>,
-    }
-
-    if let Ok(req) = serde_json::from_str::<RpcReq>(text)
-        && req.method == Some("eth_syncing")
-    {
-        let id_str = req.id.map(|v| v.get()).unwrap_or("null");
-        return Some(format!(
-            r#"{{"jsonrpc":"2.0","id":{},"result":false}}"#,
-            id_str
-        ));
-    }
-    None
 }
 
 async fn http_proxy_with_path<B>(
@@ -348,250 +313,6 @@ where
     http_proxy_with_path(req, state, upstream_base, None, client).await
 }
 
-fn build_ws_request(req: &Request<Incoming>, upstream_url: &str) -> Result<Request<()>, BoxError> {
-    let req_pq = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
-    let target_uri = if req_pq == "/" {
-        upstream_url.to_string()
-    } else {
-        let base = upstream_url.trim_end_matches('/');
-        format!("{base}{req_pq}")
-    };
-    let parsed_uri: http::Uri = target_uri.parse()?;
-
-    let mut upstream_req = Request::builder()
-        .method(Method::GET)
-        .uri(&target_uri)
-        .body(())?;
-
-    // Copy headers from client request
-    *upstream_req.headers_mut() = req.headers().clone();
-
-    // Strip host and content-length, but keep Connection and Upgrade
-    upstream_req.headers_mut().remove(http::header::HOST);
-    upstream_req
-        .headers_mut()
-        .remove(http::header::CONTENT_LENGTH);
-
-    // Re-insert correct Host header for upstream
-    if let Some(auth) = parsed_uri.authority() {
-        upstream_req.headers_mut().insert(
-            http::header::HOST,
-            http::HeaderValue::from_str(auth.as_str())?,
-        );
-    }
-
-    // Ensure Sec-WebSocket-Key and Sec-WebSocket-Version are present for HTTP/1.1 upstream handshake
-    if !upstream_req
-        .headers()
-        .contains_key(http::header::SEC_WEBSOCKET_KEY)
-    {
-        let key = tokio_tungstenite::tungstenite::handshake::client::generate_key();
-        upstream_req.headers_mut().insert(
-            http::header::SEC_WEBSOCKET_KEY,
-            http::HeaderValue::from_str(&key)?,
-        );
-    }
-    if !upstream_req
-        .headers()
-        .contains_key(http::header::SEC_WEBSOCKET_VERSION)
-    {
-        upstream_req.headers_mut().insert(
-            http::header::SEC_WEBSOCKET_VERSION,
-            http::HeaderValue::from_static("13"),
-        );
-    }
-
-    // Ensure Connection and Upgrade are correct
-    upstream_req.headers_mut().insert(
-        http::header::CONNECTION,
-        http::HeaderValue::from_static("Upgrade"),
-    );
-    upstream_req.headers_mut().insert(
-        http::header::UPGRADE,
-        http::HeaderValue::from_static("websocket"),
-    );
-
-    Ok(upstream_req)
-}
-
-fn get_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-    let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
-    config.max_message_size = Some(64 * 1024 * 1024); // 64MB
-    config.max_frame_size = Some(16 * 1024 * 1024); // 16MB
-    config
-}
-
-async fn ws_upgrade(
-    mut req: Request<Incoming>,
-    upstream_url: String,
-    connect_timeout: Duration,
-    trust_upstream: bool,
-) -> Result<Response<ResBody>, BoxError> {
-    // Dial the upstream WebSocket *before* completing the client upgrade. If we
-    // returned 101 first and the upstream were down, the client would see a
-    // successful handshake immediately followed by an abnormal close with no
-    // reason. Connecting first lets a dead or slow upstream surface as a 502 on
-    // the handshake instead — and bounds the dial so a hung upstream can't leak
-    // a half-open client connection.
-    let ws_req = build_ws_request(&req, &upstream_url)?;
-    let ws_config = get_ws_config();
-    let upstream_ws = match tokio::time::timeout(
-        connect_timeout,
-        tokio_tungstenite::connect_async_with_config(ws_req, Some(ws_config), false),
-    )
-    .await
-    {
-        Ok(Ok((ws, _))) => {
-            configure_ws_keepalive(&ws);
-            ws
-        }
-        Ok(Err(e)) => {
-            debug!(error = %e, upstream = %upstream_url, "upstream ws connect failed");
-            return Ok(text_response(
-                StatusCode::BAD_GATEWAY,
-                format!("upstream ws connect failed: {e}"),
-            ));
-        }
-        Err(_) => {
-            debug!(upstream = %upstream_url, "upstream ws connect timed out");
-            return Ok(text_response(
-                StatusCode::BAD_GATEWAY,
-                "upstream ws connect timed out",
-            ));
-        }
-    };
-
-    let (response, websocket) = hyper_tungstenite::upgrade(&mut req, Some(ws_config))?;
-    tokio::spawn(async move {
-        let client_ws = match websocket.await {
-            Ok(ws) => ws,
-            Err(e) => {
-                debug!(error = %e, "client ws upgrade failed");
-                return;
-            }
-        };
-        debug!(upstream = %upstream_url, "ws bridge established");
-        bridge_ws(client_ws, upstream_ws, trust_upstream).await;
-    });
-    Ok(response.map(box_full))
-}
-
-/// HTTP/2 Extended CONNECT (RFC 8441) WebSocket. The handshake differs from h1
-/// (200, not 101; no `Upgrade` header), but the tunnel carries the same RFC 6455
-/// frames — so we terminate the h2 stream, wrap it (server role), and reuse
-/// `bridge_ws` to relay to the upstream h1 WebSocket.
-async fn ws_upgrade_h2(
-    req: Request<Incoming>,
-    upstream_url: String,
-    connect_timeout: Duration,
-    trust_upstream: bool,
-) -> Result<Response<ResBody>, BoxError> {
-    // Dial the upstream WebSocket first, same as the h1 path, so a dead upstream
-    // is a 502 rather than an accepted-then-dropped tunnel.
-    let ws_req = build_ws_request(&req, &upstream_url)?;
-    let ws_config = get_ws_config();
-    let upstream_ws = match tokio::time::timeout(
-        connect_timeout,
-        tokio_tungstenite::connect_async_with_config(ws_req, Some(ws_config), false),
-    )
-    .await
-    {
-        Ok(Ok((ws, _))) => {
-            configure_ws_keepalive(&ws);
-            ws
-        }
-        Ok(Err(e)) => {
-            debug!(error = %e, upstream = %upstream_url, "upstream ws connect failed");
-            return Ok(text_response(
-                StatusCode::BAD_GATEWAY,
-                format!("upstream ws connect failed: {e}"),
-            ));
-        }
-        Err(_) => {
-            debug!(upstream = %upstream_url, "upstream ws connect timed out");
-            return Ok(text_response(
-                StatusCode::BAD_GATEWAY,
-                "upstream ws connect timed out",
-            ));
-        }
-    };
-
-    let on_upgrade = hyper::upgrade::on(req);
-    tokio::spawn(async move {
-        match on_upgrade.await {
-            Ok(upgraded) => {
-                let client_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
-                    TokioIo::new(upgraded),
-                    Role::Server,
-                    Some(ws_config),
-                )
-                .await;
-                debug!(upstream = %upstream_url, "h2 ws bridge established");
-                bridge_ws(client_ws, upstream_ws, trust_upstream).await;
-            }
-            Err(e) => debug!(error = %e, "h2 ws upgrade failed"),
-        }
-    });
-
-    // 200 accepts the Extended CONNECT; the stream then becomes the WS tunnel.
-    Ok(text_response(StatusCode::OK, Bytes::new()))
-}
-
-async fn bridge_ws<C, U>(
-    client_ws: tokio_tungstenite::WebSocketStream<C>,
-    upstream_ws: tokio_tungstenite::WebSocketStream<U>,
-    trust_upstream: bool,
-) where
-    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let _guard = crate::metrics::ActiveConnectionGuard::new("ws");
-    let (c_tx, mut c_rx) = client_ws.split();
-    let (mut u_tx, mut u_rx) = upstream_ws.split();
-    let c_tx = Arc::new(tokio::sync::Mutex::new(c_tx));
-    let c_tx_clone = c_tx.clone();
-
-    let c2u = async move {
-        while let Some(Ok(m)) = c_rx.next().await {
-            if trust_upstream
-                && let Ok(text) = m.to_text()
-                && let Some(resp) = try_mock_ws_eth_syncing(text)
-            {
-                if c_tx_clone
-                    .lock()
-                    .await
-                    .send(tokio_tungstenite::tungstenite::Message::Text(resp.into()))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                continue;
-            }
-            if u_tx.send(m).await.is_err() {
-                break;
-            }
-        }
-    };
-    let u2c = async move {
-        while let Some(Ok(m)) = u_rx.next().await {
-            if c_tx.lock().await.send(m).await.is_err() {
-                break;
-            }
-        }
-    };
-    tokio::pin!(c2u);
-    tokio::pin!(u2c);
-    tokio::select! {
-        _ = &mut c2u => {},
-        _ = &mut u2c => {},
-    }
-}
-
 pub(crate) fn classify_request<B>(req: &Request<B>) -> (&'static str, &'static str) {
     let upstream_type = if is_cl_path(req.uri().path()) {
         "CL"
@@ -603,7 +324,7 @@ pub(crate) fn classify_request<B>(req: &Request<B>) -> (&'static str, &'static s
             .extensions()
             .get::<hyper::ext::Protocol>()
             .is_some_and(|p| p.as_str() == "websocket")
-        || hyper_tungstenite::is_upgrade_request(req)
+        || crate::websocket::is_upgrade_request(req)
     {
         "WS"
     } else {
@@ -630,28 +351,6 @@ pub fn text_response(code: StatusCode, msg: impl Into<Bytes>) -> Response<ResBod
         .header("content-type", "text/plain; charset=utf-8")
         .body(box_full(Full::new(msg.into())))
         .unwrap()
-}
-
-fn configure_ws_keepalive(
-    ws: &tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-) {
-    let inner = ws.get_ref();
-    let tcp_stream = match inner {
-        tokio_tungstenite::MaybeTlsStream::Plain(s) => Some(s),
-        tokio_tungstenite::MaybeTlsStream::Rustls(s) => Some(s.get_ref().0),
-        _ => None,
-    };
-    if let Some(stream) = tcp_stream {
-        let sock_ref = socket2::SockRef::from(stream);
-        let keepalive = socket2::TcpKeepalive::new()
-            .with_time(Duration::from_secs(60))
-            .with_interval(Duration::from_secs(10));
-        if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
-            debug!(error = %e, "failed to set upstream WS TCP keepalive");
-        }
-    }
 }
 
 #[cfg(test)]

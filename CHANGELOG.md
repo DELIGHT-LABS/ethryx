@@ -11,10 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Include project license texts, dependency license notices, and Rust library notices in every release binary archive, with verification before upload.
+- Add default/all-feature CI checks on Linux, macOS and Windows.
 
 ### Changed
 
 - Offer Ethryx under `MIT OR Apache-2.0`, preserving the existing MIT license as an option.
+- Update the dependency lockfile and OpenTelemetry stack; disable unused Prometheus, metrics utility, futures and telemetry features, and remove the redundant Hyper–Tungstenite adapter.
+- Share WebSocket HTTP/1 and HTTP/2 handshake/relay code and HTTP/WebSocket JSON-RPC mock parsing. Reduce WebSocket buffers and eliminate the extra sink mutex on ordinary relays while retaining frame/message limits and protocol validation.
+- Borrow EL JSON result slices, deserialize Beacon responses directly into typed data, and assemble mock batch replies in one output buffer.
+
+### Fixed
+
+- Preserve WebSocket subprotocol selection and allow bounded close-handshake draining.
+- Handle escaped JSON-RPC method names and notifications correctly; preserve explicit null/large IDs and forward mixed batches intact.
+- Bound health checks through response-body completion and mock POST collection by size and time.
+- Use HTTP/1.1 for trusted cleartext upstreams when health-based h2c detection is disabled.
+- Initialize the actual OTel tracer before the subscriber, use per-signal OTLP paths, and shut down trace and metric providers on Ctrl-C or Unix SIGTERM without blocking Tokio workers.
 
 ## [0.2.4] - 2026-07-23
 
