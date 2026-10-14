@@ -21,10 +21,25 @@ pub struct AppState {
     /// speak it, so an h2c↔h1 change self-heals within one poll.
     pub el_use_h2: AtomicBool,
     pub el_http_uri: Uri,
+    pub el_ws_uri: Uri,
+    pub cl_beacon_uri: Uri,
+    pub cl_mev_relay_uri: Option<Uri>,
     pub cl_syncing_uri: Uri,
     pub cl_peer_count_uri: Uri,
     pub cl_genesis_time: u64,
     pub cl_seconds_per_slot: u64,
+    pub otel_enabled: bool,
     /// Latest background health poll, read by `/healthz` and `/readyz`.
     pub probe: watch::Receiver<Arc<Probe>>,
+}
+
+impl AppState {
+    /// Resolve one transport snapshot, shared by probing and forwarding.
+    pub fn el_client(&self, use_h2: bool) -> &ProxyClient {
+        if use_h2 {
+            &self.el_h2_client
+        } else {
+            &self.client
+        }
+    }
 }

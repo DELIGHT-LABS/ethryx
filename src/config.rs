@@ -130,8 +130,8 @@ pub struct Config {
     )]
     pub log_level: String,
 
-    /// Emit a per-connection access log (one line per connection: peer, the
-    /// negotiated HTTP version, method and path) on the `access_log` target.
+    /// Emit a per-request access log (peer, HTTP version, method, path,
+    /// upstream, protocol, status, and latency_ms) on the `access_log` target.
     /// Off by default — the main log stays quiet at `info` (lifecycle and state
     /// changes only); health-probe paths are excluded even when this is on.
     /// `RUST_LOG` can target it directly, e.g. `RUST_LOG=access_log=info`.

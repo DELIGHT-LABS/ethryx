@@ -66,9 +66,7 @@ impl Telemetry {
     }
 }
 
-pub async fn start(
-    endpoint: Option<&str>,
-) -> Result<Option<Telemetry>, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn start(endpoint: Option<&str>) -> Result<Option<Telemetry>, crate::BoxError> {
     let Some(endpoint) = endpoint else {
         return Ok(None);
     };
@@ -78,10 +76,7 @@ pub async fn start(
         .map(Some)
 }
 
-fn signal_endpoint(
-    endpoint: &str,
-    signal: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+fn signal_endpoint(endpoint: &str, signal: &str) -> Result<String, crate::BoxError> {
     let uri: http::Uri = endpoint.parse()?;
     if !matches!(uri.scheme_str(), Some("http" | "https"))
         || uri.authority().is_none()
@@ -93,7 +88,7 @@ fn signal_endpoint(
     Ok(format!("{}/v1/{signal}", endpoint.trim_end_matches('/')))
 }
 
-fn init_otel(endpoint: &str) -> Result<Telemetry, Box<dyn std::error::Error + Send + Sync>> {
+fn init_otel(endpoint: &str) -> Result<Telemetry, crate::BoxError> {
     // Set global propagator to W3C TraceContext
     global::set_text_map_propagator(opentelemetry_sdk::propagation::TraceContextPropagator::new());
 
