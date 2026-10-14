@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/DELIGHT-LABS/ethryx/actions/workflows/ci.yml/badge.svg)](https://github.com/DELIGHT-LABS/ethryx/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/DELIGHT-LABS/ethryx?include_prereleases&sort=semver)](https://github.com/DELIGHT-LABS/ethryx/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-yellow.svg)](LICENSE)
 [![Rust 1.95+](https://img.shields.io/badge/rust-1.95%2B-blue.svg)](rust-toolchain.toml)
 
 Lightweight Rust reverse proxy and health-check sidecar for Ethereum **Execution Layer** (EL)
@@ -379,9 +379,48 @@ push triggers `.github/workflows/release.yml`, which:
 
 1. Verifies `Cargo.toml` version matches the tag
 2. Creates a GitHub Release with auto-generated notes
-3. Builds static `musl` binaries and attaches them with `.sha256` checksums:
+3. Generates license notices from `Cargo.lock` for each release target
+4. Builds binaries with `--locked`, verifies the archive contents, and attaches
+   them with `.sha256` checksums and build provenance attestations:
    - `ethryx-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz`
    - `ethryx-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz`
+   - `ethryx-vX.Y.Z-aarch64-apple-darwin.tar.gz`
+   - `ethryx-vX.Y.Z-x86_64-pc-windows-msvc.zip`
+
+Every binary archive includes `LICENSE` (Ethryx's dual-license notice),
+`LICENSE-MIT` and `LICENSE-APACHE` (the full license texts),
+`THIRD_PARTY_LICENSES.txt` (dependency inventory, license texts and upstream
+copyright/notice files, plus musl's copyright notice on Linux musl targets),
+and `RUST_LIBRARY_LICENSES.html` (the active Rust toolchain's library notices).
+Notice generation or archive verification failures stop the release upload.
+
+To regenerate notices locally with Python 3.9+:
+
+```sh
+cargo install cargo-about --version 0.9.2 --locked --features cli
+python3 scripts/generate-licenses.py --target x86_64-unknown-linux-musl
+# For a custom build, use the same --features / --all-features /
+# --no-default-features flags as cargo build.
+```
+
+Generated files live in `target/release-licenses/` and are not checked in.
+`about.toml` controls accepted licenses; keep it aligned with `deny.toml`.
+CI checks both default and all features for every release target. Build
+dependencies and complete upstream license bundles are retained conservatively,
+so notices can include code that the final binary does not use. When changing
+Rust or the native toolchain, also review [the musl notice](licenses/README.md).
 
 `cargo-release` is configured under `[package.metadata.release]` in `Cargo.toml`
 (main-branch only, no crates.io publish, `cargo test --locked` as pre-hook).
+
+## License
+
+Ethryx is available under either the [MIT license](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE), at your option
+(`MIT OR Apache-2.0`). Third-party dependencies retain their own licenses.
+
+## Contributions
+
+By submitting a contribution for inclusion in Ethryx, you agree to license it
+under both MIT and Apache-2.0, unless you explicitly state otherwise.
+Contributions carry no additional terms or conditions unless separately agreed.

@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 <!-- next-header -->
+## [Unreleased] - ReleaseDate
+
+### Added
+
+- Include project license texts, dependency license notices, and Rust library notices in every release binary archive, with verification before upload.
+
+### Changed
+
+- Offer Ethryx under `MIT OR Apache-2.0`, preserving the existing MIT license as an option.
+
 ## [0.2.4] - 2026-07-23
 
 ### Added

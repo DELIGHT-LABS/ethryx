@@ -58,6 +58,42 @@ jobs:
       - name: cargo deny check
         uses: EmbarkStudios/cargo-deny-action@v2
 
+  licenses:
+    name: License notices (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.2
+
+      - name: Generate default-feature notices
+        run: python scripts/generate-licenses.py --target ${{ matrix.target }}
+
+      - name: Generate all-feature notices
+        run: >-
+          python scripts/generate-licenses.py --target ${{ matrix.target }}
+          --all-features --output-dir target/all-feature-licenses
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
