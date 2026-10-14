@@ -12,20 +12,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Include project license texts, dependency license notices, and Rust library notices in every release binary archive, with verification before upload.
 - Add default/all-feature CI checks on Linux, macOS and Windows.
+- Add seeded million-input JSON differential stress and sustained WebSocket churn checks.
 
 ### Changed
 
+- Classify each request once for routing and observability, pre-parse upstream URIs at startup and reuse inbound path/query without re-parsing on root-based upstreams, skip body generation on `HEAD` probes, skip the background health poll loop under `--trust-upstream`, and gate per-request tracing spans, `access_log` capture, and context propagation on active subscriber targets or OpenTelemetry. Pass WebSocket drain guards explicitly without request-extension storage.
+
 - Offer Ethryx under `MIT OR Apache-2.0`, preserving the existing MIT license as an option.
 - Update the dependency lockfile and OpenTelemetry stack; disable unused Prometheus, metrics utility, futures and telemetry features, and remove the redundant Hyper–Tungstenite adapter.
-- Share WebSocket HTTP/1 and HTTP/2 handshake/relay code and HTTP/WebSocket JSON-RPC mock parsing. Reduce WebSocket buffers and eliminate the extra sink mutex on ordinary relays while retaining frame/message limits and protocol validation.
-- Borrow EL JSON result slices, deserialize Beacon responses directly into typed data, and assemble mock batch replies in one output buffer.
+- Share WebSocket HTTP/1 and HTTP/2 handshake/relay code and HTTP/WebSocket JSON-RPC mock parsing. Reduce WebSocket buffers and eliminate the extra sink mutex on ordinary relays (and `Arc` wrapping on mocked relays) while retaining frame/message limits and protocol validation.
+- Deserialize EL hex quantities and Beacon decimal fields directly into typed `u64` data, and assemble mock batch replies in one output buffer without retaining request vectors. Stop batch inspection at the first request requiring upstream handling.
+- Skip full mock parsing for UTF-8 inputs up to 256 bytes when both the target method text and JSON escapes are absent, and abort full parsing immediately at non-`eth_syncing` method fields; retain full validation for every possible local reply.
 
 ### Fixed
 
-- Preserve WebSocket subprotocol selection and allow bounded close-handshake draining.
-- Handle escaped JSON-RPC method names and notifications correctly; preserve explicit null/large IDs and forward mixed batches intact.
+- Generate license reports through an explicit UTF-8 file so Windows PowerShell releases do not fail on cargo-about's redirected-output guard.
+- Preserve WebSocket subprotocol selection across split header lines, strip hop-by-hop and `Connection`-nominated headers before restoring canonical upstream handshake headers, and apply bounded close-handshake draining to both standard and mocked relays. Decline unsupported extensions and reject unsolicited extension or ambiguous subprotocol responses.
+- Separate base path joining from query merging when constructing upstream URIs so query-authenticated base URLs preserve both paths and queries.
+- Share one shutdown deadline across HTTP connections, HTTP/2 request tasks and WebSocket relays, including late handshakes. Wait for cancellation cleanup before returning from the library and handle an already completed shutdown future.
+- Keep HTTP/2 WebSocket upgrades working on probe-named paths by classifying health probes by both method and path.
+- Handle escaped JSON-RPC method names and notifications correctly; mock `eth_syncing` only when `params` is omitted or an empty array (`[]`), preserve explicit null/large IDs, and forward non-empty `params` or mixed batches intact. Require request objects and validate complete local batches before replying.
+- Accept split and token-list WebSocket upgrade headers while retaining key/version validation. Carry the classified handshake mode through dispatch so HTTP/1 CONNECT cannot bypass validation; require version 13 for HTTP/2 Extended CONNECT.
+- Require object-shaped Beacon envelopes/data, EL response/block objects, and canonical `0x`-prefixed hex quantities so positional arrays or malformed hex strings cannot pass health validation. Parse the fixed three-response EL batch in a single pass without heap-allocating a vector while preserving ID validation and partial results.
 - Bound health checks through response-body completion and mock POST collection by size and time.
-- Use HTTP/1.1 for trusted cleartext upstreams when health-based h2c detection is disabled.
+- Use HTTP/1.1 for trusted cleartext upstreams when health-based h2c detection is disabled, and avoid redundant cleartext h2c probes on `https://` EL upstreams.
 - Initialize the actual OTel tracer before the subscriber, use per-signal OTLP paths, and shut down trace and metric providers on Ctrl-C or Unix SIGTERM without blocking Tokio workers.
 
 ## [0.2.4] - 2026-07-23

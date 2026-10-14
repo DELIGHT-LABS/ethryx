@@ -1,8 +1,8 @@
 use clap::Parser;
-use ethryx::Config;
+use ethryx::{BoxError, Config};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> Result<(), BoxError> {
     let cfg = Config::parse();
 
     #[cfg(feature = "otel")]

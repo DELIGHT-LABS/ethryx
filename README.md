@@ -90,7 +90,8 @@ instead of typing both; `--cl-genesis-time 0` omits `cl.slot_age_secs`.
 ### Polling
 
 `/readyz` and `/healthz` don't query upstream per request. A background task
-polls all signals, then waits `--health-poll-interval` (default 1s; each call
+polls the EL batch and both CL endpoints concurrently, then waits
+`--health-poll-interval` (default 1s; each call
 bounded by `--health-timeout`, including the response body) before the next poll, and the endpoints return
 the latest snapshot instantly — so upstream load is constant regardless of probe
 rate, a slow upstream never blocks a probe, and the poller pauses a full interval
@@ -127,11 +128,21 @@ WebSocket works over both transports: the HTTP/1.1 `Upgrade` handshake and
 HTTP/2 Extended CONNECT (RFC 8441, `:protocol=websocket`). Either is bridged to
 the upstream's HTTP/1.1 WebSocket (`--el-ws-url`).
 
-Subprotocol selection is relayed from the upstream. Frames remain limited to
-16 MiB and complete messages to 64 MiB, including fragmented messages. The
-relay uses 8 KiB read buffers that grow for larger frames and 16 KiB write
-buffers; ordinary forwarding needs no additional shared sink mutex. Tungstenite
+Subprotocol offers from all request header lines are combined, and the selected
+protocol is relayed from the upstream. Unsupported extensions, including
+compression, are not negotiated; unsolicited extension responses are rejected.
+Frames remain limited to 16 MiB and complete messages to 64 MiB, including
+fragmented messages. The
+relay reads in 8 KiB chunks with frame storage that grows for larger frames,
+and uses 16 KiB write buffers; ordinary forwarding needs no additional shared
+sink mutex. Tungstenite
 continues to validate masking, UTF-8, control frames, and upstream handshakes.
+
+Shutdown sets one deadline shared by HTTP connections, HTTP/2 request tasks
+and WebSocket relays. Existing work can finish during `--shutdown-grace`; late
+handshakes use the time remaining. At the deadline, pending work is cancelled,
+and the library waits for its futures and sockets to be released before returning,
+including with zero grace or an already completed shutdown future.
 
 The upstream client auto-negotiates h2 for `https://` upstreams via ALPN. A
 cleartext EL JSON-RPC upstream can't be auto-negotiated, so the health poller

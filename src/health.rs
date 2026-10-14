@@ -97,22 +97,56 @@ struct ClStatus {
     is_syncing: bool,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ElSyncingResult {
     Synced(bool),
     Syncing {
-        #[serde(rename = "currentBlock")]
-        current_block: String,
-        #[serde(rename = "highestBlock")]
-        highest_block: String,
+        current_block: u64,
+        highest_block: u64,
     },
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+impl<'de> serde::Deserialize<'de> for ElSyncingResult {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct SyncingFields {
+            #[serde(rename = "currentBlock", deserialize_with = "hex_string")]
+            current_block: u64,
+            #[serde(rename = "highestBlock", deserialize_with = "hex_string")]
+            highest_block: u64,
+        }
+        struct SyncingVisitor;
+        impl<'de> serde::de::Visitor<'de> for SyncingVisitor {
+            type Value = ElSyncingResult;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a boolean or an eth_syncing progress object")
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(ElSyncingResult::Synced(v))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let fields = <SyncingFields as serde::Deserialize>::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(ElSyncingResult::Syncing {
+                    current_block: fields.current_block,
+                    highest_block: fields.highest_block,
+                })
+            }
+        }
+        deserializer.deserialize_any(SyncingVisitor)
+    }
+}
+
+#[derive(serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ElBlockResult {
-    pub number: String,
-    pub timestamp: String,
+    #[serde(deserialize_with = "hex_string")]
+    pub number: u64,
+    #[serde(deserialize_with = "hex_string")]
+    pub timestamp: u64,
 }
 
 /// The five upstream probe results captured by one poll, shared with the request
@@ -122,7 +156,7 @@ pub struct ElBlockResult {
 #[derive(Clone)]
 pub(crate) struct Probe {
     el_syncing: Result<ElSyncingResult, String>,
-    el_peers: Result<String, String>,
+    el_peers: Result<u64, String>,
     el_block: Result<ElBlockResult, String>,
     cl_status: Result<ClStatus, String>,
     cl_peers: Result<u64, String>,
@@ -147,7 +181,10 @@ const EL_BATCH_REQ: &[u8] = br#"[{"jsonrpc":"2.0","method":"eth_syncing","params
 /// `/healthz` — verdict-free EL + CL snapshot, **always 200**. Serves the latest
 /// background poll (see [`poll_loop`]); block / slot ages are recomputed live per
 /// request. Intended for dashboards / alerting; use [`ready`] as the LB gate.
-pub fn report(state: &AppState) -> Response<ResBody> {
+pub fn report(state: &AppState, head: bool) -> Response<ResBody> {
+    if head {
+        return empty_json_response(StatusCode::OK);
+    }
     let probe = state.probe.borrow();
     let mut snapshot = build_snapshot(
         &probe.el_syncing,
@@ -190,7 +227,7 @@ fn transport_label(uses_h2: bool, scheme: Option<&str>) -> &'static str {
 /// With `--readyz-strict`, EL block age and CL slot age must also be within
 /// their thresholds — choose this when serving strictly-at-head data matters
 /// more than fleet availability during a network-wide stall.
-pub fn ready(state: &AppState) -> Response<ResBody> {
+pub fn ready(state: &AppState, head: bool) -> Response<ResBody> {
     let probe = state.probe.borrow();
     let report = evaluate_ready(state, &probe);
     let code = if report.status == "ready" {
@@ -198,7 +235,11 @@ pub fn ready(state: &AppState) -> Response<ResBody> {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    json_response(code, &report)
+    if head {
+        empty_json_response(code)
+    } else {
+        json_response(code, &report)
+    }
 }
 
 /// `/eth/v1/node/health` — Consensus Layer Beacon API standard node health endpoint.
@@ -224,11 +265,7 @@ pub fn node_health(state: &AppState) -> Response<ResBody> {
         StatusCode::SERVICE_UNAVAILABLE
     };
 
-    Response::builder()
-        .status(code)
-        .header("content-type", "application/json")
-        .body(box_full(Full::new(Bytes::new())))
-        .expect("response builder")
+    empty_json_response(code)
 }
 
 /// Build the `/readyz` verdict from a probe snapshot. Default gates on EL + CL
@@ -310,10 +347,10 @@ pub(crate) async fn probe_once(state: &AppState) -> Probe {
     if state.cfg.trust_upstream {
         return Probe {
             el_syncing: Ok(ElSyncingResult::Synced(false)),
-            el_peers: Ok("0x64".into()),
+            el_peers: Ok(100),
             el_block: Ok(ElBlockResult {
-                number: "0x0".into(),
-                timestamp: "0x0".into(),
+                number: 0,
+                timestamp: 0,
             }),
             cl_status: Ok(ClStatus {
                 head_slot: 0,
@@ -324,24 +361,19 @@ pub(crate) async fn probe_once(state: &AppState) -> Probe {
         };
     }
 
-    // Probe EL in a single batch request, which also performs transport detection.
-    let batch = el_batch_detect(state).await;
-    let (cl_status, cl_peers) = tokio::join!(cl_syncing_status(state), cl_peer_count(state));
+    // Independent upstreams share one poll; a slow EL does not delay CL calls.
+    // EL still uses one batch request and owns transport detection.
+    let (batch, cl_status, cl_peers) = tokio::join!(
+        el_batch_detect(state),
+        cl_syncing_status(state),
+        cl_peer_count(state),
+    );
     Probe {
         el_syncing: batch.syncing.map_err(|e| e.to_string()),
         el_peers: batch.peers.map_err(|e| e.to_string()),
         el_block: batch.block.map_err(|e| e.to_string()),
         cl_status,
         cl_peers,
-    }
-}
-
-/// The EL client picked by the current `el_use_h2` verdict.
-fn el_client(state: &AppState) -> &ProxyClient {
-    if state.el_use_h2.load(Ordering::Relaxed) {
-        &state.el_h2_client
-    } else {
-        &state.client
     }
 }
 
@@ -368,68 +400,52 @@ impl std::fmt::Display for HealthError {
 
 struct ElBatchResult {
     syncing: Result<ElSyncingResult, HealthError>,
-    peers: Result<String, HealthError>,
+    peers: Result<u64, HealthError>,
     block: Result<ElBlockResult, HealthError>,
+}
+
+impl ElBatchResult {
+    fn from_error(error: HealthError) -> Self {
+        Self {
+            syncing: Err(error.clone()),
+            peers: Err(error.clone()),
+            block: Err(error),
+        }
+    }
 }
 
 /// Query all three EL JSON-RPC methods in a batch request, maintaining the transport verdict.
 async fn el_batch_detect(state: &AppState) -> ElBatchResult {
-    let prefer_h2 = state.el_use_h2.load(Ordering::Relaxed);
     let payload = Bytes::from_static(EL_BATCH_REQ);
-    let primary = el_batch_rpc(state, payload.clone(), el_client(state)).await;
+    if state.el_http_uri.scheme_str() == Some("https") {
+        // TLS upstreams negotiate h2 vs http/1.1 via ALPN on the default client.
+        return el_batch_rpc(state, payload, &state.client)
+            .await
+            .unwrap_or_else(ElBatchResult::from_error);
+    }
+    let prefer_h2 = state.el_use_h2.load(Ordering::Relaxed);
+    let primary = el_batch_rpc(state, payload.clone(), state.el_client(prefer_h2)).await;
 
-    match primary {
-        Ok(res) => res,
-        Err(e) if is_transport(&e) => {
-            // The preferred transport failed at the connection level — try the other one.
-            let other = if prefer_h2 {
-                &state.client
+    let result = match primary {
+        Err(primary_error) if is_transport(&primary_error) => {
+            let alternate = el_batch_rpc(state, payload, state.el_client(!prefer_h2)).await;
+            if matches!(&alternate, Err(error) if is_transport(error)) {
+                // Both transports failed: keep the verdict and original error.
+                Err(primary_error)
             } else {
-                &state.el_h2_client
-            };
-            let alt = el_batch_rpc(state, payload, other).await;
-            match alt {
-                Ok(res) => {
-                    state.el_use_h2.store(!prefer_h2, Ordering::Relaxed);
-                    if prefer_h2 {
-                        warn!("EL JSON-RPC upstream stopped speaking h2c — using HTTP/1.1");
-                    } else {
-                        info!("EL JSON-RPC upstream speaks h2c — using HTTP/2");
-                    }
-                    res
+                // Even an HTTP/decode error proves the alternate reached upstream.
+                state.el_use_h2.store(!prefer_h2, Ordering::Relaxed);
+                if prefer_h2 {
+                    warn!("EL JSON-RPC upstream stopped speaking h2c — using HTTP/1.1");
+                } else {
+                    info!("EL JSON-RPC upstream speaks h2c — using HTTP/2");
                 }
-                Err(alt_err) => {
-                    if is_transport(&alt_err) {
-                        // Both transports failed at the connection level → upstream down.
-                        // Keep current verdict and report original error.
-                        ElBatchResult {
-                            syncing: Err(e.clone()),
-                            peers: Err(e.clone()),
-                            block: Err(e),
-                        }
-                    } else {
-                        // Alternative transport reached upstream (non-transport error, e.g. 404) → switch.
-                        state.el_use_h2.store(!prefer_h2, Ordering::Relaxed);
-                        if prefer_h2 {
-                            warn!("EL JSON-RPC upstream stopped speaking h2c — using HTTP/1.1");
-                        } else {
-                            info!("EL JSON-RPC upstream speaks h2c — using HTTP/2");
-                        }
-                        ElBatchResult {
-                            syncing: Err(alt_err.clone()),
-                            peers: Err(alt_err.clone()),
-                            block: Err(alt_err),
-                        }
-                    }
-                }
+                alternate
             }
         }
-        Err(e) => ElBatchResult {
-            syncing: Err(e.clone()),
-            peers: Err(e.clone()),
-            block: Err(e),
-        },
-    }
+        result => result,
+    };
+    result.unwrap_or_else(ElBatchResult::from_error)
 }
 
 /// A hard transport/connection failure or a timeout (vs. an HTTP status or decode
@@ -449,10 +465,8 @@ pub(crate) fn update_metrics(probe: &Probe, report: &ReadyReport) {
         .set(if report.cl_syncing.ok { 1.0 } else { 0.0 });
 
     // 2. EL peers
-    if let Ok(peers_hex) = &probe.el_peers {
-        if let Some(peers) = hex_to_u64(peers_hex) {
-            ::metrics::gauge!("ethryx_upstream_peers", "layer" => "el").set(peers as f64);
-        }
+    if let Ok(peers) = probe.el_peers {
+        ::metrics::gauge!("ethryx_upstream_peers", "layer" => "el").set(peers as f64);
     } else {
         ::metrics::gauge!("ethryx_upstream_peers", "layer" => "el").set(0.0);
     }
@@ -470,12 +484,8 @@ pub(crate) fn update_metrics(probe: &Probe, report: &ReadyReport) {
             current_block,
             highest_block,
         }) => {
-            let current = hex_to_u64(current_block);
-            let highest = hex_to_u64(highest_block);
-            if let (Some(c), Some(h)) = (current, highest) {
-                ::metrics::gauge!("ethryx_upstream_sync_distance", "layer" => "el")
-                    .set(h.saturating_sub(c) as f64);
-            }
+            ::metrics::gauge!("ethryx_upstream_sync_distance", "layer" => "el")
+                .set(highest_block.saturating_sub(*current_block) as f64);
         }
         _ => {
             ::metrics::gauge!("ethryx_upstream_sync_distance", "layer" => "el").set(0.0);
@@ -492,13 +502,8 @@ pub(crate) fn update_metrics(probe: &Probe, report: &ReadyReport) {
     }
 
     // 6. EL block number
-    if let Some(num) = probe
-        .el_block
-        .as_ref()
-        .ok()
-        .and_then(|block| hex_to_u64(&block.number))
-    {
-        ::metrics::gauge!("ethryx_upstream_block_number").set(num as f64);
+    if let Ok(block) = &probe.el_block {
+        ::metrics::gauge!("ethryx_upstream_block_number").set(block.number as f64);
     }
 }
 
@@ -514,19 +519,19 @@ pub(crate) fn update_metrics(probe: &Probe, report: &ReadyReport) {
 pub(crate) async fn poll_loop(
     state: Arc<AppState>,
     tx: watch::Sender<Arc<Probe>>,
-    mut shutdown: watch::Receiver<bool>,
+    mut shutdown: crate::lifecycle::Shutdown,
     interval: Duration,
 ) {
     let mut prev_ready: Option<bool> = None;
     loop {
         tokio::select! {
             biased;
-            _ = shutdown.changed() => return,
+            _ = crate::lifecycle::deadline(&mut shutdown) => return,
             _ = tokio::time::sleep(interval) => {}
         }
         let probe = tokio::select! {
             biased;
-            _ = shutdown.changed() => return,
+            _ = crate::lifecycle::deadline(&mut shutdown) => return,
             probe = probe_once(&state) => probe,
         };
 
@@ -565,6 +570,14 @@ pub(crate) async fn poll_loop(
     }
 }
 
+fn empty_json_response(code: StatusCode) -> Response<ResBody> {
+    Response::builder()
+        .status(code)
+        .header("content-type", "application/json")
+        .body(box_full(Full::new(Bytes::new())))
+        .expect("response builder")
+}
+
 fn json_response<T: Serialize>(code: StatusCode, body: &T) -> Response<ResBody> {
     let body_bytes = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
     Response::builder()
@@ -590,16 +603,11 @@ fn check_el_syncing(r: &Result<ElSyncingResult, String>) -> Check {
             current_block,
             highest_block,
         }) => {
-            let current = hex_to_u64(current_block);
-            let highest = hex_to_u64(highest_block);
-            let detail = match (current, highest) {
-                (Some(c), Some(h)) => {
-                    let distance = h.saturating_sub(c);
-                    format!("syncing (block {c}, distance {distance})")
-                }
-                _ => format!("syncing (current {current_block}, highest {highest_block})"),
-            };
-            Check { ok: false, detail }
+            let distance = highest_block.saturating_sub(*current_block);
+            Check {
+                ok: false,
+                detail: format!("syncing (block {current_block}, distance {distance})"),
+            }
         }
         Err(e) => Check {
             ok: false,
@@ -634,27 +642,17 @@ fn check_cl_syncing(r: &Result<ClStatus, String>) -> Check {
 fn check_el_block_fresh(r: &Result<ElBlockResult, String>, max_age: u64, now: u64) -> Check {
     match r {
         Ok(block) => {
-            let ts = hex_to_u64(&block.timestamp);
-            let num = hex_to_u64(&block.number);
-            match (num, ts) {
-                (Some(n), Some(t)) => {
-                    let age = now.saturating_sub(t);
-                    if age <= max_age {
-                        Check {
-                            ok: true,
-                            detail: format!("block {n}, age {age}s"),
-                        }
-                    } else {
-                        Check {
-                            ok: false,
-                            detail: format!("block {n} stale: {age}s (max {max_age})"),
-                        }
-                    }
+            let age = now.saturating_sub(block.timestamp);
+            if age <= max_age {
+                Check {
+                    ok: true,
+                    detail: format!("block {}, age {age}s", block.number),
                 }
-                _ => Check {
+            } else {
+                Check {
                     ok: false,
-                    detail: "block missing fields".into(),
-                },
+                    detail: format!("block {} stale: {age}s (max {max_age})", block.number),
+                }
             }
         }
         Err(e) => Check {
@@ -705,7 +703,7 @@ fn check_cl_slot_fresh(
 #[allow(clippy::too_many_arguments)]
 fn build_snapshot(
     sync_r: &Result<ElSyncingResult, String>,
-    peers_r: &Result<String, String>,
+    peers_r: &Result<u64, String>,
     block_r: &Result<ElBlockResult, String>,
     cl_status_r: &Result<ClStatus, String>,
     cl_peers_r: &Result<u64, String>,
@@ -722,35 +720,18 @@ fn build_snapshot(
             highest_block,
         }) => {
             el.syncing = Some(true);
-            let current = hex_to_u64(current_block);
-            let highest = hex_to_u64(highest_block);
-            el.sync_distance = match (current, highest) {
-                (Some(c), Some(h)) => Some(h.saturating_sub(c)),
-                _ => None,
-            };
+            el.sync_distance = Some(highest_block.saturating_sub(*current_block));
         }
         Err(e) => el.errors.push(format!("eth_syncing: {e}")),
     }
     match peers_r {
-        Ok(hex) => match hex_to_u64(hex) {
-            Some(n) => el.peers = Some(n),
-            None => el.errors.push(format!("net_peerCount invalid hex: {hex}")),
-        },
+        Ok(n) => el.peers = Some(*n),
         Err(e) => el.errors.push(format!("net_peerCount: {e}")),
     }
     match block_r {
         Ok(block) => {
-            let ts = hex_to_u64(&block.timestamp);
-            let num = hex_to_u64(&block.number);
-            match (num, ts) {
-                (Some(n), Some(t)) => {
-                    el.block_number = Some(n);
-                    el.block_age_secs = Some(now.saturating_sub(t));
-                }
-                _ => el
-                    .errors
-                    .push("eth_getBlockByNumber: missing fields".into()),
-            }
+            el.block_number = Some(block.number);
+            el.block_age_secs = Some(now.saturating_sub(block.timestamp));
         }
         Err(e) => el.errors.push(format!("eth_getBlockByNumber: {e}")),
     }
@@ -832,28 +813,34 @@ fn parse_el_batch(body: &[u8]) -> Result<ElBatchResult, HealthError> {
         error: Option<&'a serde_json::value::RawValue>,
     }
 
-    let arr: Vec<RpcResponse<'_>> =
+    #[derive(serde::Deserialize)]
+    #[serde(transparent)]
+    struct HexQuantity(#[serde(deserialize_with = "hex_string")] u64);
+
+    let arr: [JsonObject<RpcResponse<'_>>; 3] =
         serde_json::from_slice(body).map_err(|e| HealthError::Decode(e.to_string()))?;
-
-    if arr.len() != 3 {
-        return Err(HealthError::Decode(format!(
-            "expected 3 responses, got {}",
-            arr.len()
-        )));
+    let mut slots: [Option<RpcResponse<'_>>; 3] = [None, None, None];
+    for JsonObject(resp) in arr {
+        let Some(idx) = usize::try_from(resp.id)
+            .ok()
+            .and_then(|id| id.checked_sub(1))
+            .filter(|&idx| idx < 3)
+        else {
+            return Err(HealthError::Decode(
+                "duplicate or unexpected response id".into(),
+            ));
+        };
+        if slots[idx].replace(resp).is_some() {
+            return Err(HealthError::Decode(
+                "duplicate or unexpected response id".into(),
+            ));
+        }
     }
 
-    if arr.iter().any(|res| !(1..=3).contains(&res.id))
-        || (1..=3).any(|id| arr.iter().filter(|res| res.id == id).count() != 1)
-    {
-        return Err(HealthError::Decode(
-            "duplicate or unexpected response id".into(),
-        ));
-    }
-    let parse_res = |id_val: i64| -> Result<&serde_json::value::RawValue, HealthError> {
-        let resp = arr
-            .iter()
-            .find(|res| res.id == id_val)
-            .ok_or_else(|| HealthError::Decode(format!("missing response for id {id_val}")))?;
+    let decode_res = |idx: usize| -> Result<&serde_json::value::RawValue, HealthError> {
+        let resp = slots[idx]
+            .as_ref()
+            .ok_or_else(|| HealthError::Decode(format!("missing response for id {}", idx + 1)))?;
         if let Some(err) = resp.error {
             return Err(HealthError::Rpc(err.get().to_owned()));
         }
@@ -861,14 +848,18 @@ fn parse_el_batch(body: &[u8]) -> Result<ElBatchResult, HealthError> {
             .ok_or_else(|| HealthError::Decode("missing result".into()))
     };
 
-    let syncing = parse_res(1).and_then(|raw| {
+    let syncing = decode_res(0).and_then(|raw| {
         serde_json::from_str(raw.get()).map_err(|e| HealthError::Decode(e.to_string()))
     });
-    let peers = parse_res(2).and_then(|raw| {
-        serde_json::from_str(raw.get()).map_err(|e| HealthError::Decode(e.to_string()))
+    let peers = decode_res(1).and_then(|raw| {
+        serde_json::from_str::<HexQuantity>(raw.get())
+            .map(|HexQuantity(n)| n)
+            .map_err(|e| HealthError::Decode(e.to_string()))
     });
-    let block = parse_res(3).and_then(|raw| {
-        serde_json::from_str(raw.get()).map_err(|e| HealthError::Decode(e.to_string()))
+    let block = decode_res(2).and_then(|raw| {
+        serde_json::from_str::<JsonObject<ElBlockResult>>(raw.get())
+            .map(|JsonObject(block)| block)
+            .map_err(|e| HealthError::Decode(e.to_string()))
     });
 
     Ok(ElBatchResult {
@@ -878,9 +869,38 @@ fn parse_el_batch(body: &[u8]) -> Result<ElBatchResult, HealthError> {
     })
 }
 
+// Serde's derived struct visitors also accept positional sequences. Enforce
+// object shape at each upstream boundary while retaining borrowed RawValue data.
+struct JsonObject<T>(T);
+
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for JsonObject<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Object<T>(std::marker::PhantomData<T>);
+        impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for Object<T> {
+            type Value = JsonObject<T>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                T::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(JsonObject)
+            }
+        }
+        deserializer.deserialize_map(Object(std::marker::PhantomData))
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct ClEnvelope<T> {
-    data: T,
+    data: JsonObject<T>,
+}
+
+fn parse_cl_response<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, String> {
+    serde_json::from_slice::<JsonObject<ClEnvelope<T>>>(body)
+        .map(|JsonObject(envelope)| envelope.data.0)
+        .map_err(|e| format!("decode: {e}"))
 }
 
 fn decimal_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
@@ -895,6 +915,20 @@ fn decimal_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u
         }
     }
     deserializer.deserialize_str(Decimal)
+}
+
+fn hex_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    struct Hex;
+    impl serde::de::Visitor<'_> for Hex {
+        type Value = u64;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a 0x-prefixed hex quantity string")
+        }
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<u64, E> {
+            hex_to_u64(value).ok_or_else(|| E::custom(format!("invalid hex quantity: {value}")))
+        }
+    }
+    deserializer.deserialize_str(Hex)
 }
 
 async fn cl_syncing_status(state: &AppState) -> Result<ClStatus, String> {
@@ -923,13 +957,18 @@ async fn cl_get_json<T: serde::de::DeserializeOwned>(
     let body = fetch_bytes(state, req, &state.client)
         .await
         .map_err(|e| e.to_string())?;
-    serde_json::from_slice::<ClEnvelope<T>>(&body)
-        .map(|v| v.data)
-        .map_err(|e| format!("decode: {e}"))
+    parse_cl_response(&body)
 }
 
 fn hex_to_u64(s: &str) -> Option<u64> {
-    u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()
+    let digits = s.strip_prefix("0x")?;
+    if digits.is_empty()
+        || (digits.len() > 1 && digits.starts_with('0'))
+        || !digits.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    u64::from_str_radix(digits, 16).ok()
 }
 
 fn now_unix() -> u64 {
@@ -943,11 +982,181 @@ fn now_unix() -> u64 {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn el_transport_fallback_preserves_verdict_and_error_policy() {
+        use clap::Parser;
+        use hyper::body::Incoming;
+        use hyper::service::service_fn;
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use hyper_util::server::conn::auto;
+        use std::sync::atomic::AtomicUsize;
+
+        let valid = br#"[{"id":1,"result":false},{"id":2,"result":"0x40"},{"id":3,"result":{"number":"0x1","timestamp":"0x2"}}]"#;
+        // Preferred transport, accepted [h1, h2], response, expected transport.
+        for (prefer_h2, accepted, status, body, expected_h2) in [
+            (true, [true, true], 200, valid.as_slice(), true),
+            (true, [true, true], 503, b"unavailable".as_slice(), true),
+            (true, [true, true], 200, b"invalid JSON".as_slice(), true),
+            (false, [true, true], 503, b"unavailable".as_slice(), false),
+            (true, [true, false], 200, valid.as_slice(), false),
+            (true, [true, false], 503, b"unavailable".as_slice(), false),
+            (true, [true, false], 200, b"invalid JSON".as_slice(), false),
+            (false, [false, true], 200, valid.as_slice(), true),
+            (false, [false, true], 503, b"unavailable".as_slice(), true),
+            (false, [false, true], 200, b"invalid JSON".as_slice(), true),
+            (true, [false, false], 200, valid.as_slice(), true),
+            (false, [false, false], 200, valid.as_slice(), false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let attempts = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+            let counts = attempts.clone();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let counts = counts.clone();
+                    tokio::spawn(async move {
+                        let mut preface = [0; 3];
+                        let h2 =
+                            stream.peek(&mut preface).await.unwrap() == 3 && &preface == b"PRI";
+                        counts[usize::from(h2)].fetch_add(1, Ordering::Relaxed);
+                        if !accepted[usize::from(h2)] {
+                            // On total failure distinguish the original h2 timeout
+                            // from the alternate h1 connection error.
+                            if h2 && !accepted.contains(&true) {
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                            }
+                            return;
+                        }
+                        let svc = service_fn(move |req: Request<Incoming>| async move {
+                            req.into_body().collect().await.unwrap();
+                            Ok::<_, std::convert::Infallible>(
+                                Response::builder()
+                                    .status(status)
+                                    .body(Full::new(Bytes::from_static(body)))
+                                    .unwrap(),
+                            )
+                        });
+                        let _ = auto::Builder::new(TokioExecutor::new())
+                            .serve_connection(TokioIo::new(stream), svc)
+                            .await;
+                    });
+                }
+            });
+            let mut cfg = crate::Config::parse_from(["ethryx", "--el-http-url", &url]);
+            cfg.health_timeout = Duration::from_secs(1);
+            let (_, probe) = watch::channel(Arc::new(Probe::pending()));
+            let state = AppState {
+                el_http_uri: url.parse().unwrap(),
+                el_ws_uri: "ws://127.0.0.1:8546".parse().unwrap(),
+                cl_beacon_uri: url.parse().unwrap(),
+                cl_mev_relay_uri: None,
+                cl_syncing_uri: url.parse().unwrap(),
+                cl_peer_count_uri: url.parse().unwrap(),
+                cfg,
+                client: crate::proxy::build_client(false),
+                el_h2_client: crate::proxy::build_client(true),
+                el_use_h2: std::sync::atomic::AtomicBool::new(prefer_h2),
+                otel_enabled: false,
+                cl_genesis_time: 0,
+                cl_seconds_per_slot: 12,
+                probe,
+            };
+            let result = el_batch_detect(&state).await;
+            assert_eq!(state.el_use_h2.load(Ordering::Relaxed), expected_h2);
+            assert_eq!(attempts[usize::from(prefer_h2)].load(Ordering::Relaxed), 1);
+            assert_eq!(
+                attempts[usize::from(!prefer_h2)].load(Ordering::Relaxed),
+                usize::from(!accepted[usize::from(prefer_h2)])
+            );
+            if !accepted.contains(&true) {
+                let error = result.syncing.unwrap_err();
+                if prefer_h2 {
+                    assert_eq!(error, HealthError::Timeout);
+                } else {
+                    assert!(matches!(error, HealthError::Transport(_)));
+                }
+                assert_eq!(result.peers.unwrap_err(), error);
+                assert_eq!(result.block.unwrap_err(), error);
+            } else if status == 503 {
+                assert_eq!(
+                    result.syncing.unwrap_err(),
+                    HealthError::HttpStatus(StatusCode::SERVICE_UNAVAILABLE)
+                );
+            } else if body == valid {
+                assert_eq!(result.syncing.unwrap(), ElSyncingResult::Synced(false));
+                assert_eq!(result.peers.unwrap(), 0x40);
+            } else {
+                assert!(matches!(result.syncing, Err(HealthError::Decode(_))));
+            }
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn beacon_envelope_and_data_require_objects() {
+        for input in [
+            r#"[["123","0",false]]"#,
+            r#"{"data":["123","0",false]}"#,
+            r#"[{"head_slot":"123","sync_distance":"0","is_syncing":false}]"#,
+            r#"{"data":null}"#,
+            r#"{"data":{"head_slot":"123","sync_distance":"0","is_syncing":false},"data":{}}"#,
+            r#"{"data":{"head_slot":"123","head_slot":"123","sync_distance":"0","is_syncing":false}}"#,
+            r#"{"data":{"head_slot":"123","sync_distance":"0","is_syncing":false}}x"#,
+        ] {
+            assert!(
+                parse_cl_response::<ClStatus>(input.as_bytes()).is_err(),
+                "{input}"
+            );
+        }
+        assert!(parse_cl_response::<ClStatus>(br#"{"extra":[],"data":{"head_slot":"123","sync_distance":"0","is_syncing":false,"ignored":true}}"#).is_ok());
+    }
+
+    #[test]
+    fn el_batch_requires_three_object_responses_and_object_blocks() {
+        let replies = [
+            r#"{"id":1,"result":false}"#,
+            r#"{"id":2,"result":"0x40"}"#,
+            r#"{"id":3,"result":{"number":"0x1","timestamp":"0x2"}}"#,
+        ];
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let input = format!("[{}]", order.map(|i| replies[i]).join(","));
+            let parsed = parse_el_batch(input.as_bytes()).unwrap();
+            assert_eq!(parsed.syncing.unwrap(), ElSyncingResult::Synced(false));
+            assert_eq!(parsed.peers.unwrap(), 0x40);
+            assert_eq!(parsed.block.unwrap().timestamp, 2);
+        }
+        for input in [
+            format!("[{},{}]", replies[0], replies[1]),
+            format!(
+                "[{},{},{},{}]",
+                replies[0], replies[1], replies[2], replies[0]
+            ),
+            r#"[[1,false,null],{"id":2,"result":"0x40"},{"id":3,"result":{}}]"#.into(),
+            r#"[[1,false,null],[2,"0x40",null],[3,{"number":"0x1","timestamp":"0x2"},null]]"#
+                .into(),
+        ] {
+            assert!(parse_el_batch(input.as_bytes()).is_err(), "{input}");
+        }
+        let parsed = parse_el_batch(br#"[{"id":1,"result":false},{"id":2,"result":"0x40"},{"id":3,"result":["0x1","0x2"]}]"#).unwrap();
+        assert!(parsed.syncing.is_ok());
+        assert!(parsed.peers.is_ok());
+        assert!(parsed.block.is_err());
+        assert!(serde_json::from_str::<ElSyncingResult>(r#"["0x1","0x2"]"#).is_err());
+    }
+
     #[test]
     fn el_batch_matches_ids_in_any_order_and_keeps_partial_results() {
         let parsed = parse_el_batch(br#"[{"id":3,"result":{"number":"0x42","timestamp":"0x43"}},{"id":1,"result":false},{"id":2,"error":{"code":-32000,"message":"unavailable"}}]"#).unwrap();
         assert_eq!(parsed.syncing.unwrap(), ElSyncingResult::Synced(false));
-        assert_eq!(parsed.block.unwrap().number, "0x42");
+        assert_eq!(parsed.block.unwrap().number, 0x42);
         assert!(matches!(parsed.peers, Err(HealthError::Rpc(_))));
     }
 
@@ -982,16 +1191,24 @@ mod tests {
     }
 
     #[test]
-    fn hex_without_prefix() {
-        assert_eq!(hex_to_u64("ff"), Some(255));
-        assert_eq!(hex_to_u64("a"), Some(10));
-    }
-
-    #[test]
-    fn hex_invalid_returns_none() {
-        assert_eq!(hex_to_u64("0xZZ"), None);
-        assert_eq!(hex_to_u64(""), None);
-        assert_eq!(hex_to_u64("not hex"), None);
+    fn hex_rejects_non_canonical_or_malformed_quantities() {
+        for invalid in [
+            "",
+            "0x",
+            "0X10",
+            "ff",
+            "a",
+            "0x00",
+            "0x01",
+            "0x+10",
+            "0x-10",
+            "0x0x10",
+            "0xZZ",
+            "not hex",
+            "0x10000000000000000",
+        ] {
+            assert_eq!(hex_to_u64(invalid), None, "{invalid}");
+        }
     }
 
     #[test]
@@ -1002,8 +1219,8 @@ mod tests {
     #[test]
     fn typed_beacon_response_preserves_decimal_semantics() {
         let response: ClEnvelope<ClStatus> = serde_json::from_str(r#"{"data":{"head_slot":"9412341","sync_distance":"0","is_syncing":false,"extra":{"ignored":true}}}"#).unwrap();
-        assert_eq!(response.data.head_slot, 9_412_341);
-        assert_eq!(response.data.sync_distance, 0);
+        assert_eq!(response.data.0.head_slot, 9_412_341);
+        assert_eq!(response.data.0.sync_distance, 0);
         for value in [
             "42",
             "null",
@@ -1037,8 +1254,8 @@ mod tests {
     #[test]
     fn el_syncing_object_reports_block_progress() {
         let c = check_el_syncing(&Ok(ElSyncingResult::Syncing {
-            current_block: "0x10".to_string(),
-            highest_block: "0x20".to_string(),
+            current_block: 0x10,
+            highest_block: 0x20,
         }));
         assert!(!c.ok);
         assert_eq!(c.detail, "syncing (block 16, distance 16)");
@@ -1078,8 +1295,8 @@ mod tests {
     #[test]
     fn el_block_fresh_within_threshold_is_ok() {
         let block = ElBlockResult {
-            number: "0x5".to_string(),
-            timestamp: "0x3e2".to_string(),
+            number: 5,
+            timestamp: 0x3e2,
         };
         let c = check_el_block_fresh(&Ok(block), 60, 1000);
         assert!(c.ok);
@@ -1089,8 +1306,8 @@ mod tests {
     #[test]
     fn el_block_fresh_past_threshold_is_stale() {
         let block = ElBlockResult {
-            number: "0x5".to_string(),
-            timestamp: "0x384".to_string(),
+            number: 5,
+            timestamp: 0x384,
         };
         let c = check_el_block_fresh(&Ok(block), 60, 1000);
         assert!(!c.ok);
@@ -1149,10 +1366,10 @@ mod tests {
     fn snapshot_reports_numeric_values_when_healthy() {
         let snap = build_snapshot(
             &Ok(ElSyncingResult::Synced(false)),
-            &Ok("0x10".to_string()),
+            &Ok(0x10),
             &Ok(ElBlockResult {
-                number: "0x5".to_string(),
-                timestamp: "0x3e2".to_string(),
+                number: 5,
+                timestamp: 0x3e2,
             }),
             &Ok(ClStatus {
                 head_slot: 10,
@@ -1173,7 +1390,7 @@ mod tests {
         assert_eq!(snap.cl.peers, Some(64));
         assert_eq!(snap.cl.head_slot, Some(10));
         assert_eq!(snap.cl.slot_age_secs, Some(180));
-        assert!(snap.cl.errors.is_empty());
+        assert!(snap.el.errors.is_empty());
     }
 
     #[test]
@@ -1200,8 +1417,8 @@ mod tests {
     fn snapshot_reports_el_sync_distance_while_syncing() {
         let snap = build_snapshot(
             &Ok(ElSyncingResult::Syncing {
-                current_block: "0x10".to_string(),
-                highest_block: "0x20".to_string(),
+                current_block: 0x10,
+                highest_block: 0x20,
             }),
             &Err("skip".to_string()),
             &Err("skip".to_string()),
@@ -1219,10 +1436,10 @@ mod tests {
     fn snapshot_omits_cl_slot_age_when_genesis_disabled() {
         let snap = build_snapshot(
             &Ok(ElSyncingResult::Synced(false)),
-            &Ok("0x10".to_string()),
+            &Ok(0x10),
             &Ok(ElBlockResult {
-                number: "0x5".to_string(),
-                timestamp: "0x3e2".to_string(),
+                number: 5,
+                timestamp: 0x3e2,
             }),
             &Ok(ClStatus {
                 head_slot: 10,
