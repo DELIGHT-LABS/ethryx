@@ -122,7 +122,7 @@ async fn post_json(c: &TestClient, url: &str, body: Value) -> (StatusCode, Bytes
 struct RecordedRequest {
     method: Method,
     path: String,
-    #[allow(dead_code)]
+    uri: http::Uri,
     headers: http::HeaderMap,
     version: Version,
     body: Bytes,
@@ -188,6 +188,7 @@ impl MockServer {
                         async move {
                             let method = req.method().clone();
                             let path = req.uri().path().to_owned();
+                            let uri = req.uri().clone();
                             let headers = req.headers().clone();
                             let version = req.version();
                             let body_bytes = req.into_body().collect().await.unwrap().to_bytes();
@@ -204,6 +205,7 @@ impl MockServer {
                                         let rr = RecordedRequest {
                                             method: method.clone(),
                                             path: path.clone(),
+                                            uri: uri.clone(),
                                             headers: headers.clone(),
                                             version,
                                             body: Bytes::from(item_bytes),
@@ -235,6 +237,7 @@ impl MockServer {
                                 let rr = RecordedRequest {
                                     method: method.clone(),
                                     path: path.clone(),
+                                    uri: uri.clone(),
                                     headers: headers.clone(),
                                     version,
                                     body: body_bytes.clone(),
@@ -284,14 +287,19 @@ struct EthryxHandle {
 
 impl EthryxHandle {
     async fn start(args: &[&str]) -> Self {
+        Self::start_with_grace(args, Duration::ZERO).await
+    }
+
+    async fn start_with_grace(args: &[&str], grace: Duration) -> Self {
         let port = pick_port().await;
         let addr_str = format!("127.0.0.1:{port}");
+        let grace_str = grace.as_secs().to_string();
         let mut argv: Vec<&str> = vec![
             "ethryx",
             "--listen",
             &addr_str,
             "--shutdown-grace",
-            "0",
+            &grace_str,
             "--health-timeout",
             "1",
             "--proxy-timeout",
@@ -600,30 +608,168 @@ async fn client_specific_beacon_paths_are_routed_to_cl_upstream() {
 
 #[tokio::test]
 async fn hop_by_hop_headers_are_stripped_on_forward() {
-    let el = MockServer::start(Arc::new(|req| {
-        // Verify ethryx removed hop-by-hop headers when forwarding.
-        // We can't introspect headers here (mock only sees method/path/body),
-        // but we can return a marker so the test still exercises forwarding.
-        let _ = req;
-        (StatusCode::OK, br#"{"ok":true}"#.to_vec())
-    }))
-    .await;
-    let cl = MockServer::start(ok_handler()).await;
-    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+    for upstream_h2 in [false, true] {
+        let el = MockServer::serve(ok_handler(), upstream_h2, false).await;
+        let cl = MockServer::start(ok_handler()).await;
+        let ethryx =
+            EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(ethryx.url("/"))
+            .header("content-type", "application/json")
+            .header("connection", "keep-alive, X-One")
+            .header("connection", "x-two")
+            .header("x-one", "private")
+            .header("x-two", "private")
+            .header("proxy-connection", "keep-alive")
+            .header("authorization", "Bearer retained")
+            .body(Full::new(Bytes::from_static(b"{}")))
+            .unwrap();
+        let resp = client().request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.into_body().collect().await.unwrap();
+        let received = el.received();
+        let forwarded = received.last().unwrap();
+        assert_eq!(
+            forwarded.version,
+            if upstream_h2 {
+                Version::HTTP_2
+            } else {
+                Version::HTTP_11
+            }
+        );
+        for name in ["connection", "x-one", "x-two", "proxy-connection"] {
+            assert!(!forwarded.headers.contains_key(name), "leaked {name}");
+        }
+        assert_eq!(forwarded.headers["authorization"], "Bearer retained");
+        assert_eq!(forwarded.headers["content-type"], "application/json");
+        assert_eq!(forwarded.body, "{}");
+        ethryx.shutdown().await;
+    }
+}
 
-    let c = client();
-    // Send with a connection header; ethryx must drop it.
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri(ethryx.url("/"))
-        .header("content-type", "application/json")
-        .header("connection", "close")
-        .body(Full::new(Bytes::from(b"{}".to_vec())))
-        .unwrap();
-    let resp = c.request(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
+#[tokio::test]
+async fn response_connection_options_are_stripped_for_h1_and_h2_clients() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let svc = service_fn(|req: Request<Incoming>| async move {
+                    req.into_body().collect().await.unwrap();
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .header("connection", "keep-alive, X-One")
+                            .header("connection", "x-two")
+                            .header("x-one", "private")
+                            .header("x-two", "private")
+                            .header("proxy-connection", "keep-alive")
+                            .header("x-end-to-end", "retained")
+                            .body(Full::new(Bytes::from_static(b"response body")))
+                            .unwrap(),
+                    )
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    let ethryx = EthryxHandle::start(&["--trust-upstream", "--cl-beacon-url", &upstream]).await;
+    for c in [client(), h2c_client()] {
+        let req = Request::builder()
+            .uri(ethryx.url("/eth/header-test"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = c.request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        for name in ["connection", "x-one", "x-two", "proxy-connection"] {
+            assert!(!resp.headers().contains_key(name), "leaked {name}");
+        }
+        assert_eq!(resp.headers()["x-end-to-end"], "retained");
+        assert_eq!(
+            resp.into_body().collect().await.unwrap().to_bytes(),
+            "response body"
+        );
+    }
     ethryx.shutdown().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn health_probes_run_together_and_preserve_partial_failures() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let server = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let barrier = barrier.clone();
+                    async move {
+                        let path = req.uri().path().to_owned();
+                        req.into_body().collect().await.unwrap();
+                        // No response is released until all three probes arrive.
+                        barrier.wait().await;
+                        let (status, body) = match path.as_str() {
+                            "/" => (
+                                StatusCode::OK,
+                                r#"[{"id":3,"error":{"code":-32000,"message":"block unavailable"}},{"id":1,"result":false},{"id":2,"result":"0x40"}]"#,
+                            ),
+                            "/eth/v1/node/syncing" => {
+                                (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+                            }
+                            "/eth/v1/node/peer_count" => {
+                                (StatusCode::OK, r#"{"data":{"connected":"42"}}"#)
+                            }
+                            _ => panic!("unexpected probe {path}"),
+                        };
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(status)
+                                .body(Full::new(Bytes::from_static(body.as_bytes())))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    let ethryx = EthryxHandle::start(&[
+        "--el-http-url",
+        &upstream,
+        "--cl-beacon-url",
+        &upstream,
+        "--health-poll-interval",
+        "60",
+    ])
+    .await;
+    let (_, body) = get(&client(), &ethryx.url("/healthz")).await;
+    let health: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(health["el"]["syncing"], false, "{health}");
+    assert_eq!(health["el"]["peers"], 64, "{health}");
+    assert_eq!(health["cl"]["peers"], 42, "{health}");
+    assert!(
+        health["el"]["errors"][0]
+            .as_str()
+            .unwrap()
+            .contains("block unavailable"),
+        "{health}"
+    );
+    assert!(
+        health["cl"]["errors"][0].as_str().unwrap().contains("503"),
+        "{health}"
+    );
+    let (status, _) = get(&client(), &ethryx.url("/readyz")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    ethryx.shutdown().await;
+    server.abort();
 }
 
 #[tokio::test]
@@ -1192,6 +1338,7 @@ async fn http2_extended_connect_ws_502_when_upstream_down() {
 
     let mut req = Request::builder()
         .method(Method::CONNECT)
+        .header("sec-websocket-version", "13")
         .uri(format!("http://127.0.0.1:{}/", ethryx.port))
         .body(Full::<Bytes>::new(Bytes::new()))
         .unwrap();
@@ -1239,39 +1386,54 @@ async fn http2_extended_connect_ws_bridges_to_upstream() {
         let _ = conn.await;
     });
 
-    let mut req = Request::builder()
-        .method(Method::CONNECT)
-        .uri(format!("http://127.0.0.1:{}/", ethryx.port))
-        .body(Full::<Bytes>::new(Bytes::new()))
-        .unwrap();
-    req.extensions_mut()
-        .insert(hyper::ext::Protocol::from_static("websocket"));
+    let mut sockets = Vec::new();
+    for path in ["/", "/healthz", "/readyz", "/livez", "/metrics"] {
+        let mut req = Request::builder()
+            .method(Method::CONNECT)
+            .header("sec-websocket-version", "13")
+            .uri(format!("http://127.0.0.1:{}{path}", ethryx.port))
+            .body(Full::<Bytes>::new(Bytes::new()))
+            .unwrap();
+        req.extensions_mut()
+            .insert(hyper::ext::Protocol::from_static("websocket"));
 
-    let resp = sender.send_request(req).await.expect("extended CONNECT");
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "extended CONNECT should be 200"
-    );
-    assert_eq!(resp.version(), Version::HTTP_2);
+        let resp = sender.send_request(req).await.expect("extended CONNECT");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "extended CONNECT should be 200"
+        );
+        assert_eq!(resp.version(), Version::HTTP_2);
 
-    let upgraded = hyper::upgrade::on(resp).await.expect("upgrade");
-    let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
-        TokioIo::new(upgraded),
-        tokio_tungstenite::tungstenite::protocol::Role::Client,
-        None,
-    )
-    .await;
-    ws.send(Message::Text("ping".into())).await.unwrap();
-    let echoed = loop {
-        match ws.next().await.expect("a reply").expect("ok frame") {
-            Message::Text(t) => break t,
-            _ => continue,
-        }
-    };
-    assert_eq!(echoed.as_str(), "ping");
+        let upgraded = hyper::upgrade::on(resp).await.expect("upgrade");
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            TokioIo::new(upgraded),
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        ws.send(Message::Text("ping".into())).await.unwrap();
+        let echoed = loop {
+            match ws.next().await.expect("a reply").expect("ok frame") {
+                Message::Text(t) => break t,
+                _ => continue,
+            }
+        };
+        assert_eq!(echoed.as_str(), "ping");
+
+        sockets.push(ws);
+    }
 
     ethryx.shutdown().await;
+    for mut ws in sockets {
+        let closed = tokio::time::timeout(Duration::from_secs(1), ws.next())
+            .await
+            .expect("shutdown must release an HTTP/2 upgraded stream");
+        assert!(matches!(
+            closed,
+            None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+        ));
+    }
 }
 
 #[tokio::test]
@@ -1471,7 +1633,28 @@ async fn metrics_endpoint_returns_formatted_prometheus_metrics() {
     assert!(metrics_str.contains("ethryx_upstream_health_status"));
     assert!(metrics_str.contains("ethryx_upstream_peers"));
 
+    let request_count = |text: &str| -> f64 {
+        text.lines()
+            .filter(|line| line.starts_with("ethryx_proxy_requests_total{"))
+            .filter(|line| line.contains("method=\"POST\""))
+            .map(|line| line.rsplit_once(' ').unwrap().1.parse::<f64>().unwrap())
+            .sum()
+    };
+    let before = request_count(&metrics_str);
     ethryx.shutdown().await;
+
+    // A second run in the same runtime reuses the process-global recorder.
+    let second = EthryxHandle::start(&["--trust-upstream", "--mock-eth-syncing"]).await;
+    let (status, _) = post_json(
+        &c,
+        &second.url("/"),
+        json!({"jsonrpc":"2.0","method":"eth_syncing","id":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = get(&c, &second.url("/metrics")).await;
+    assert!(request_count(&String::from_utf8_lossy(&body)) >= before + 1.0);
+    second.shutdown().await;
 }
 
 #[tokio::test]
@@ -1848,4 +2031,1656 @@ async fn test_ws_handshake_preserves_upstream_path_without_trailing_slash() {
     assert_eq!(final_uri, "/v2/testkey");
 
     ethryx.shutdown().await;
+}
+
+#[tokio::test]
+async fn trusted_h1_upstream_and_http_notifications() {
+    let el = MockServer::start(ok_handler()).await;
+    let proxy = EthryxHandle::start(&[
+        "--trust-upstream",
+        "--mock-eth-syncing",
+        "--el-http-url",
+        &el.url,
+    ])
+    .await;
+    let c = client();
+    let (status, _) = post_json(
+        &c,
+        &proxy.url("/"),
+        json!({"jsonrpc":"2.0","method":"eth_call","id":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = post_json(
+        &c,
+        &proxy.url("/"),
+        json!({"jsonrpc":"2.0","method":"eth_syncing"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(body.is_empty());
+    let (status, body) = post_json(
+        &c,
+        &proxy.url("/"),
+        json!([
+            {"jsonrpc":"2.0","method":"eth_syncing"},
+            {"jsonrpc":"2.0","method":"eth_syncing","id":null}
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!([{"jsonrpc":"2.0","id":null,"result":false}])
+    );
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn mock_body_stall_has_a_deadline() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let proxy = EthryxHandle::start(&["--trust-upstream", "--mock-eth-syncing"]).await;
+    let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+        .await
+        .unwrap();
+    socket
+        .write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n{")
+        .await
+        .unwrap();
+    let mut buf = [0; 128];
+    let count = tokio::time::timeout(Duration::from_secs(4), socket.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&buf[..count]).starts_with("HTTP/1.1 408"));
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+#[allow(clippy::result_large_err)] // Tungstenite fixes the callback error type.
+async fn websocket_subprotocol_is_negotiated_end_to_end() {
+    use tokio_tungstenite::tungstenite::{
+        client::IntoClientRequest,
+        handshake::server::{Request as WsRequest, Response as WsResponse},
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws =
+            tokio_tungstenite::accept_hdr_async(socket, |req: &WsRequest, mut res: WsResponse| {
+                assert_eq!(req.headers()["sec-websocket-protocol"], "jsonrpc");
+                res.headers_mut()
+                    .insert("sec-websocket-protocol", "jsonrpc".parse().unwrap());
+                Ok(res)
+            })
+            .await
+            .unwrap();
+        if let Some(Ok(message)) = ws.next().await {
+            ws.send(message).await.unwrap();
+        }
+    });
+    let proxy =
+        EthryxHandle::start(&["--trust-upstream", "--el-ws-url", &format!("ws://{addr}")]).await;
+    let mut req = format!("ws://127.0.0.1:{}/", proxy.port)
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("sec-websocket-protocol", "jsonrpc".parse().unwrap());
+    let (mut ws, response) = connect_async(req).await.unwrap();
+    assert_eq!(response.headers()["sec-websocket-protocol"], "jsonrpc");
+    ws.send(Message::Text("hello".into())).await.unwrap();
+    assert_eq!(
+        ws.next().await.unwrap().unwrap(),
+        Message::Text("hello".into())
+    );
+    server.await.unwrap();
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn websocket_fragmented_utf8_ping_close_and_mock_batch() {
+    use tokio_tungstenite::tungstenite::protocol::frame::{
+        Frame,
+        coding::{Data, OpCode},
+    };
+    let upstream = ws_echo_upstream().await;
+    for mocking in [false, true] {
+        let mock_arg = if mocking { "true" } else { "false" };
+        let proxy = EthryxHandle::start(&[
+            "--trust-upstream",
+            "--mock-eth-syncing",
+            mock_arg,
+            "--el-ws-url",
+            &upstream,
+        ])
+        .await;
+        let (mut ws, _) = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
+            .await
+            .unwrap();
+        let text = "split 🌍".as_bytes();
+        let split = text.len() - 2;
+        ws.send(Message::Frame(Frame::message(
+            text[..split].to_vec(),
+            OpCode::Data(Data::Text),
+            false,
+        )))
+        .await
+        .unwrap();
+        ws.send(Message::Frame(Frame::message(
+            text[split..].to_vec(),
+            OpCode::Data(Data::Continue),
+            true,
+        )))
+        .await
+        .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, Message::Text("split 🌍".into()));
+        if mocking {
+            ws.send(Message::Text(
+                r#"{"jsonrpc":"2.0","method":"eth_syncing"}"#.into(),
+            ))
+            .await
+            .unwrap();
+            ws.send(Message::Text(
+                r#"[{"jsonrpc":"2.0","method":"eth_\u0073yncing","id":7}]"#.into(),
+            ))
+            .await
+            .unwrap();
+            let response = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&response).unwrap(),
+                json!([{"jsonrpc":"2.0","id":7,"result":false}])
+            );
+        }
+        ws.send(Message::Ping(b"ping".to_vec().into()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), ws.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            Message::Pong(_)
+        ));
+        ws.close(None).await.unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Pong(_))) => continue,
+                    other => break other,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(closed, Some(Ok(Message::Close(_))) | None),
+            "{closed:?}"
+        );
+        proxy.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn websocket_rejects_invalid_and_oversized_frames() {
+    use tokio::io::AsyncWriteExt;
+    let upstream = ws_echo_upstream().await;
+    let proxy = EthryxHandle::start(&["--trust-upstream", "--el-ws-url", &upstream]).await;
+    let mut oversized_pong = vec![0x8a, 0xfe, 0, 126, 0, 0, 0, 0];
+    oversized_pong.extend_from_slice(&[0; 126]);
+    let mut oversized_frame = vec![0x82, 0xff];
+    oversized_frame.extend_from_slice(&(16 * 1024 * 1024_u64 + 1).to_be_bytes());
+    oversized_frame.extend_from_slice(&[0; 4]);
+    for wire in [
+        vec![0x81, 1, b'x'],
+        oversized_pong,
+        oversized_frame,
+        vec![0xc1, 0x81, 0, 0, 0, 0, b'x'],
+        vec![0x81, 0x81, 0, 0, 0, 0, 0xff],   // invalid UTF-8 text
+        vec![0x80, 0x81, 0, 0, 0, 0, b'x'],   // continuation without a start
+        vec![0x09, 0x80, 0, 0, 0, 0],         // fragmented control frame
+        vec![0x88, 0x82, 0, 0, 0, 0, 3, 237], // forbidden close code 1005
+    ] {
+        let (mut ws, _) = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
+            .await
+            .unwrap();
+        ws.get_mut().write_all(&wire).await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .unwrap();
+        assert!(
+            matches!(reply, None | Some(Err(_)) | Some(Ok(Message::Close(_)))),
+            "{reply:?}"
+        );
+    }
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn health_timeout_includes_a_stalled_response_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stalled_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0; 4096];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n{")
+                    .await;
+                // Keep the body incomplete until the client's timeout closes it.
+                let _ = socket.read(&mut buf).await;
+            });
+        }
+    });
+    let el = MockServer::start_h2c(ok_handler()).await;
+    let proxy = tokio::time::timeout(
+        Duration::from_secs(4),
+        EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &stalled_url]),
+    )
+    .await
+    .expect("body timeout must let startup finish");
+    let (status, body) = get(&client(), &proxy.url("/healthz")).await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        value["cl"]["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| v.as_str().unwrap().contains("timeout")),
+        "{value}"
+    );
+    assert_eq!(
+        get(&client(), &proxy.url("/readyz")).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    proxy.shutdown().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn websocket_rejects_invalid_handshakes_on_both_hops() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dead = format!("ws://127.0.0.1:{}", pick_port().await);
+    let proxy = EthryxHandle::start(&["--trust-upstream", "--el-ws-url", &dead]).await;
+    for headers in [
+        "Sec-WebSocket-Version: 12\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+        "Sec-WebSocket-Version: 13\r\n", // missing key
+    ] {
+        let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+            .await
+            .unwrap();
+        socket.write_all(format!("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{headers}\r\n").as_bytes()).await.unwrap();
+        let mut buf = [0; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(2), socket.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            buf[..n].starts_with(b"HTTP/1.1 400"),
+            "{}",
+            String::from_utf8_lossy(&buf[..n])
+        );
+    }
+    proxy.shutdown().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            assert!(request.len() < 16 * 1024);
+            request.push(socket.read_u8().await.unwrap());
+        }
+        socket.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: invalid-signature\r\n\r\n").await.unwrap();
+    });
+    let proxy = EthryxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
+    let err = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WsError::Http(response) if response.status() == StatusCode::BAD_GATEWAY));
+    server.await.unwrap();
+    proxy.shutdown().await;
+}
+
+#[cfg(all(feature = "otel", unix))]
+#[tokio::test]
+async fn binary_exports_traces_and_metrics_and_flushes_on_sigterm() {
+    use std::process::{Child, Command, Stdio};
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let collector = MockServer::start(ok_handler()).await;
+    let upstream = MockServer::start(ok_handler()).await;
+    let port = pick_port().await;
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ethryx"))
+            .args([
+                "--listen",
+                &format!("127.0.0.1:{port}"),
+                "--trust-upstream",
+                "--el-http-url",
+                &upstream.url,
+                "--cl-beacon-url",
+                &upstream.url,
+                "--otel-endpoint",
+                &format!("{}/prefix", collector.url),
+                "--shutdown-grace",
+                "1",
+            ])
+            .env("OTEL_METRIC_EXPORT_INTERVAL", "100")
+            .env("OTEL_BSP_SCHEDULE_DELAY", "100")
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_port(port).await;
+    let c = client();
+    let mut exported = false;
+    for _ in 0..50 {
+        get(&c, &format!("http://127.0.0.1:{port}/eth/test")).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let requests = collector.recorded.lock().unwrap();
+        exported = ["/prefix/v1/traces", "/prefix/v1/metrics"]
+            .iter()
+            .all(|path| {
+                requests
+                    .iter()
+                    .any(|r| r.path == *path && !r.body.is_empty())
+            });
+        if exported {
+            break;
+        }
+    }
+    assert!(
+        exported,
+        "both OTLP signals must be exported by the actual binary"
+    );
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &child.0.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let status = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(status.success(), "{status}");
+}
+
+#[tokio::test]
+async fn shutdown_releases_upgraded_websocket_connections() {
+    let upstream = ws_echo_upstream().await;
+    for mocking in ["false", "true"] {
+        let proxy = EthryxHandle::start(&[
+            "--trust-upstream",
+            "--mock-eth-syncing",
+            mocking,
+            "--el-ws-url",
+            &upstream,
+        ])
+        .await;
+        let (mut ws, _) = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
+            .await
+            .unwrap();
+        ws.send(Message::Text("established".into())).await.unwrap();
+        assert_eq!(
+            ws.next().await.unwrap().unwrap(),
+            Message::Text("established".into())
+        );
+        proxy.shutdown().await;
+        let closed = tokio::time::timeout(Duration::from_secs(1), ws.next())
+            .await
+            .expect("an upgraded socket must not outlive zero-grace shutdown");
+        assert!(matches!(
+            closed,
+            None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_websocket_peer_close() {
+    let upstream = ws_echo_upstream().await;
+    let mut proxy = EthryxHandle::start_with_grace(
+        &["--trust-upstream", "--el-ws-url", &upstream],
+        Duration::from_secs(3),
+    )
+    .await;
+    let (mut ws, _) = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
+        .await
+        .unwrap();
+    ws.send(Message::Text("established".into())).await.unwrap();
+    let _ = ws.next().await.unwrap().unwrap();
+    proxy.shutdown.take().unwrap().send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !proxy.task.as_ref().unwrap().is_finished(),
+        "the active relay must remain tracked while draining"
+    );
+    ws.close(None).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(1), ws.next())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), proxy.shutdown())
+        .await
+        .expect("peer close should release the drain guard before its deadline");
+}
+
+#[tokio::test]
+async fn shutdown_bounds_an_unresponsive_websocket_peer() {
+    let upstream = ws_echo_upstream().await;
+    let proxy = EthryxHandle::start_with_grace(
+        &["--trust-upstream", "--el-ws-url", &upstream],
+        Duration::from_secs(1),
+    )
+    .await;
+    let (mut ws, _) = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
+        .await
+        .unwrap();
+    ws.send(Message::Text("established".into())).await.unwrap();
+    let _ = ws.next().await.unwrap().unwrap();
+    let start = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(3), proxy.shutdown())
+        .await
+        .unwrap();
+    assert!(
+        start.elapsed() >= Duration::from_millis(800),
+        "the relay should receive its configured grace period"
+    );
+    let closed = tokio::time::timeout(Duration::from_secs(1), ws.next())
+        .await
+        .unwrap();
+    assert!(matches!(
+        closed,
+        None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+    ));
+}
+
+#[tokio::test]
+async fn shutdown_releases_a_stalled_http_response_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let (closed_tx, closed_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut buffer = [0; 1024];
+        while !head.windows(4).any(|part| part == b"\r\n\r\n") {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert_ne!(count, 0);
+            head.extend_from_slice(&buffer[..count]);
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nprefix")
+            .await
+            .unwrap();
+        let end = socket.read(&mut buffer).await;
+        assert!(matches!(end, Ok(0) | Err(_)), "{end:?}");
+        let _ = closed_tx.send(());
+    });
+    let proxy = EthryxHandle::start(&["--trust-upstream", "--cl-beacon-url", &upstream]).await;
+    let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+        .await
+        .unwrap();
+    socket
+        .write_all(b"GET /eth/stream HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    let mut buffer = [0; 1024];
+    while !response.ends_with(b"prefix") {
+        let count = tokio::time::timeout(Duration::from_secs(2), socket.read(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(count, 0);
+        response.extend_from_slice(&buffer[..count]);
+    }
+    proxy.shutdown().await;
+    let end = tokio::time::timeout(Duration::from_secs(1), socket.read(&mut buffer))
+        .await
+        .expect("zero-grace shutdown must release the downstream body");
+    assert!(matches!(end, Ok(0) | Err(_)), "{end:?}");
+    tokio::time::timeout(Duration::from_secs(1), closed_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "sustained connection churn; set ETHRYX_STRESS_SECONDS and run explicitly"]
+async fn websocket_sustained_churn_preserves_replies_and_releases_upstreams() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Active(Arc<AtomicUsize>);
+    impl Drop for Active {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    let seconds = std::env::var("ETHRYX_STRESS_SECONDS")
+        .map(|value| value.parse::<u64>().expect("integer stress duration"))
+        .unwrap_or(30);
+    assert!((1..=600).contains(&seconds));
+    for mocking in [false, true] {
+        let active = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("ws://{}", listener.local_addr().unwrap());
+        let connections = active.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let connections = connections.clone();
+                tokio::spawn(async move {
+                    connections.fetch_add(1, Ordering::Relaxed);
+                    let _active = Active(connections);
+                    let Ok(mut ws) = accept_async(socket).await else {
+                        return;
+                    };
+                    while let Some(Ok(message)) = ws.next().await {
+                        if (message.is_text() || message.is_binary())
+                            && ws.send(message).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let proxy = EthryxHandle::start(&[
+            "--trust-upstream",
+            "--mock-eth-syncing",
+            if mocking { "true" } else { "false" },
+            "--el-ws-url",
+            &upstream,
+        ])
+        .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+        let mut workers = tokio::task::JoinSet::new();
+        for worker in 0..16 {
+            let url = format!("ws://127.0.0.1:{}/", proxy.port);
+            workers.spawn(async move {
+                let payload = Message::Binary(vec![worker as u8; 4096].into());
+                let mut operations = 0;
+                let mut round = 0;
+                while tokio::time::Instant::now() < deadline {
+                    let (mut ws, _) = connect_async(&url).await.unwrap();
+                    for request in 0..32 {
+                        if mocking && request % 3 == 2 {
+                            ws.send(Message::Text(r#"{"jsonrpc":"2.0","method":"eth_syncing"}"#.into())).await.unwrap();
+                        }
+                        let message = match request % 3 {
+                            0 => payload.clone(),
+                            1 => Message::Text(r#"{"jsonrpc":"2.0","method":"eth_syncing","id":7}"#.into()),
+                            _ => Message::Text(r#"{"jsonrpc":"2.0","method":"eth_call","params":{"tag":"eth_syncing"},"id":2}"#.into()),
+                        };
+                        ws.send(message.clone()).await.unwrap();
+                        let reply = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+                        if mocking && request % 3 == 1 {
+                            assert_eq!(serde_json::from_str::<Value>(reply.to_text().unwrap()).unwrap(), json!({"jsonrpc":"2.0","id":7,"result":false}));
+                        } else {
+                            assert_eq!(reply, message);
+                        }
+                        operations += 1;
+                    }
+                    // Alternate orderly close and abrupt disconnect, including
+                    // peers that leave the server to finish its bounded drain.
+                    if round % 2 == 0 {
+                        ws.close(None).await.unwrap();
+                        let _ = tokio::time::timeout(Duration::from_secs(3), ws.next()).await.unwrap();
+                    }
+                    drop(ws);
+                    round += 1;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                operations
+            });
+        }
+        let operations = tokio::time::timeout(Duration::from_secs(seconds + 15), async {
+            let mut operations = 0;
+            while let Some(result) = workers.join_next().await {
+                operations += result.unwrap();
+            }
+            operations
+        })
+        .await
+        .expect("churn workers must finish within the overall deadline");
+        assert!(operations >= 16 * 32);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while active.load(Ordering::Relaxed) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("all upstream relay tasks must be released after client churn");
+        assert_eq!(get(&client(), &proxy.url("/livez")).await.0, StatusCode::OK);
+        proxy.shutdown().await;
+        server.abort();
+        println!(
+            "soak mock={mocking} operations={operations} active_upstreams=0 duration_secs={seconds}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn http_forwarding_preserves_configured_uri_and_unmodified_body() {
+    let payloads: &[&[u8]] = &[
+        br#"{"jsonrpc":"2.0","method":"eth_blockNumber","id":7}"#,
+        br#"{"jsonrpc":"2.0","method":"eth_call","params":{"method":"eth_syncing"},"id":null}"#,
+        b"malformed JSON \xff",
+    ];
+    let el = MockServer::start(Arc::new(|req| (StatusCode::OK, req.body.to_vec()))).await;
+    let cl = MockServer::start(ok_handler()).await;
+    let paths = ["/", "/?tag=a%2Fb", "/rpc/extra?tag=a%2Fb"];
+    for (base_path, expected_pqs) in [
+        ("", ["/", "/?tag=a%2Fb", "/rpc/extra?tag=a%2Fb"]),
+        ("/", ["/", "/?tag=a%2Fb", "/rpc/extra?tag=a%2Fb"]),
+        (
+            "/rpc/",
+            ["/rpc/", "/rpc/?tag=a%2Fb", "/rpc/rpc/extra?tag=a%2Fb"],
+        ),
+        (
+            "/rpc?key=a%2Fb",
+            [
+                "/rpc?key=a%2Fb",
+                "/rpc?key=a%2Fb&tag=a%2Fb",
+                "/rpc/rpc/extra?key=a%2Fb&tag=a%2Fb",
+            ],
+        ),
+    ] {
+        for mock_enabled in [false, true] {
+            let upstream = format!("{}{base_path}", el.url);
+            let mut args = vec![
+                "--el-http-url",
+                &upstream,
+                "--cl-beacon-url",
+                &cl.url,
+                "--trust-upstream",
+            ];
+            if mock_enabled {
+                args.push("--mock-eth-syncing");
+            }
+            let proxy = EthryxHandle::start(&args).await;
+            for c in [client(), h2c_client()] {
+                for (path, expected_pq) in paths.into_iter().zip(expected_pqs) {
+                    for &payload in payloads {
+                        let request = Request::builder()
+                            .method(Method::POST)
+                            .uri(proxy.url(path))
+                            .body(Full::new(Bytes::copy_from_slice(payload)))
+                            .unwrap();
+                        let response = c.request(request).await.unwrap();
+                        assert_eq!(response.status(), StatusCode::OK);
+                        assert_eq!(
+                            response.into_body().collect().await.unwrap().to_bytes(),
+                            payload
+                        );
+                        let received = el.received().pop().unwrap();
+                        assert_eq!(
+                            received.uri.path_and_query().map(|pq| pq.as_str()),
+                            Some(expected_pq)
+                        );
+                        assert_eq!(received.body, payload);
+                    }
+                }
+            }
+            proxy.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn websocket_header_lists_and_http1_connect_are_validated_before_dialing() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("ws://{}", listener.local_addr().unwrap());
+    let dials = Arc::new(AtomicUsize::new(0));
+    let observed = dials.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            observed.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut ws = accept_async(socket).await.unwrap();
+                while let Some(Ok(message)) = ws.next().await {
+                    if message.is_close() {
+                        break;
+                    }
+                    ws.send(message).await.unwrap();
+                }
+            });
+        }
+    });
+    let key = "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n";
+    let canonical = "Connection: Upgrade\r\nUpgrade: websocket\r\n";
+    for mocking in [false, true] {
+        let proxy = EthryxHandle::start(&[
+            "--trust-upstream",
+            "--el-ws-url",
+            &upstream,
+            "--mock-eth-syncing",
+            if mocking { "true" } else { "false" },
+        ])
+        .await;
+        let cases = [
+            ("GET /", format!("{canonical}{key}"), true),
+            (
+                "GET /",
+                format!(
+                    "Connection: keep-alive\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{key}"
+                ),
+                true,
+            ),
+            (
+                "GET /",
+                format!(
+                    "Connection: Upgrade\r\nConnection: keep-alive\r\nUpgrade: websocket\r\n{key}"
+                ),
+                true,
+            ),
+            (
+                "GET /",
+                format!("Connection: keep-alive, Upgrade\r\nUpgrade: h2c, websocket\r\n{key}"),
+                true,
+            ),
+            (
+                "GET /",
+                format!(
+                    "Connection: keep-alive, uPgRaDe\r\nUpgrade: h2c\r\nUpgrade: WebSocket\r\n{key}"
+                ),
+                true,
+            ),
+            ("CONNECT localhost:1234", canonical.into(), false),
+            ("CONNECT localhost:1234", format!("{canonical}{key}"), false),
+            ("POST /", format!("{canonical}{key}"), false),
+            (
+                "GET /",
+                format!("{canonical}Sec-WebSocket-Version: 13\r\n"),
+                false,
+            ),
+            (
+                "GET /",
+                format!("{canonical}{key}Sec-WebSocket-Version: 13\r\n"),
+                false,
+            ),
+            (
+                "GET /",
+                format!("{canonical}{key}Sec-WebSocket-Key: invalid\r\n"),
+                false,
+            ),
+            (
+                "GET /",
+                format!("{canonical}{}", key.replace("13", "12")),
+                false,
+            ),
+            (
+                "GET /",
+                format!(
+                    "{canonical}{}",
+                    key.replace("dGhlIHNhbXBsZSBub25jZQ==", "invalid")
+                ),
+                false,
+            ),
+        ];
+        for (request_line, headers, valid) in cases {
+            let before = dials.load(Ordering::SeqCst);
+            let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+                .await
+                .unwrap();
+            socket
+                .write_all(
+                    format!("{request_line} HTTP/1.1\r\nHost: localhost\r\n{headers}\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(3), async {
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    assert!(head.len() < 16 * 1024);
+                    head.push(socket.read_u8().await.unwrap());
+                }
+                head
+            })
+            .await
+            .unwrap();
+            let status = if valid {
+                "HTTP/1.1 101"
+            } else {
+                "HTTP/1.1 400"
+            };
+            assert!(
+                response.starts_with(status.as_bytes()),
+                "{request_line} {headers}: {}",
+                String::from_utf8_lossy(&response)
+            );
+            assert_eq!(dials.load(Ordering::SeqCst) - before, usize::from(valid));
+            if valid {
+                let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                    socket,
+                    tokio_tungstenite::tungstenite::protocol::Role::Client,
+                    None,
+                )
+                .await;
+                ws.send(Message::Text("round trip".into())).await.unwrap();
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(3), ws.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap(),
+                    Message::Text("round trip".into())
+                );
+                ws.close(None).await.unwrap();
+            }
+        }
+        proxy.shutdown().await;
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn http2_websocket_rejects_missing_invalid_and_duplicate_versions_without_dialing() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("ws://{}", listener.local_addr().unwrap());
+    let proxy = EthryxHandle::start(&["--trust-upstream", "--el-ws-url", &upstream]).await;
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+        .await
+        .unwrap();
+    let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake::<_, TestBody>(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    let connection = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    for versions in [
+        vec![],
+        vec!["12"],
+        vec!["13, 13"],
+        vec!["13", "13"],
+        vec!["13", "12"],
+    ] {
+        let mut req = Request::builder()
+            .method(Method::CONNECT)
+            .uri(proxy.url("/"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        req.extensions_mut()
+            .insert(hyper::ext::Protocol::from_static("websocket"));
+        for version in versions {
+            req.headers_mut()
+                .append("sec-websocket-version", version.parse().unwrap());
+        }
+        let response = tokio::time::timeout(Duration::from_secs(2), sender.send_request(req))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err()
+    );
+    proxy.shutdown().await;
+    connection.abort();
+}
+
+#[tokio::test]
+async fn invalid_jsonrpc_batches_are_forwarded_intact_over_http_and_websocket() {
+    // This upstream echoes the complete body instead of interpreting the batch.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let service = service_fn(|request: Request<Incoming>| async move {
+                    let body = request.into_body().collect().await.unwrap().to_bytes();
+                    Ok::<_, Infallible>(Response::new(Full::new(body)))
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(socket), service)
+                    .await;
+            });
+        }
+    });
+    let ws_upstream = ws_echo_upstream().await;
+    let proxy = EthryxHandle::start(&[
+        "--trust-upstream",
+        "--mock-eth-syncing",
+        "--el-http-url",
+        &upstream,
+        "--el-ws-url",
+        &ws_upstream,
+    ])
+    .await;
+    let (mut ws, _) = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
+        .await
+        .unwrap();
+    let local = r#"{"jsonrpc":"2.0","method":"eth_syncing","id":2}"#;
+    let bodies = [
+        r#"[["2.0","eth_syncing",[],1]]"#.to_owned(),
+        r#"[["2.0","eth_syncing"]]"#.to_owned(),
+        format!(r#"[{local},["2.0","eth_syncing"]]"#),
+        format!(r#"[["2.0","eth_syncing",[],1],{local}]"#),
+        format!("[{local}] trailing"),
+        format!("[{local},]"),
+        format!("[{local}"),
+        format!(
+            r#"[{{"jsonrpc":"2.0","method":"eth_blockNumber","id":1}},{}]"#,
+            vec![local; 1000].join(",")
+        ),
+    ];
+    for body in bodies {
+        for client in [client(), h2c_client()] {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(proxy.url("/"))
+                .body(Full::new(Bytes::copy_from_slice(body.as_bytes())))
+                .unwrap();
+            let response = client.request(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                body
+            );
+        }
+        ws.send(Message::Text(body.clone().into())).await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.into_text().unwrap(), body);
+    }
+    ws.close(None).await.unwrap();
+    proxy.shutdown().await;
+    server.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_already_ready_does_not_wait_for_a_new_watch_event() {
+    let cfg = Config::parse_from([
+        "ethryx",
+        "--listen",
+        "127.0.0.1:0",
+        "--trust-upstream",
+        "--shutdown-grace",
+        "0",
+    ]);
+    tokio::time::timeout(Duration::from_secs(1), run(cfg, async {}))
+        .await
+        .expect("an already completed shutdown must stop the accept loop")
+        .unwrap();
+}
+
+async fn shutdown_during_h2_ws_handshake(complete_handshake: bool, grace: Duration) {
+    use tokio::io::AsyncReadExt;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (dial_tx, dial_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let (closed_tx, closed_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        dial_tx.send(()).unwrap();
+        if complete_handshake {
+            release_rx.await.unwrap();
+            let mut ws = accept_async(socket).await.unwrap();
+            while let Some(Ok(message)) = ws.next().await {
+                if ws.send(message).await.is_err() {
+                    break;
+                }
+            }
+        } else {
+            // Read the pending handshake, then observe cancellation of its dial.
+            let mut buffer = [0; 4096];
+            while let Ok(n) = socket.read(&mut buffer).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+        let _ = closed_tx.send(());
+    });
+    let mut proxy =
+        EthryxHandle::start_with_grace(&["--trust-upstream", "--el-ws-url", &url], grace).await;
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+        .await
+        .unwrap();
+    let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake::<_, TestBody>(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    let driver = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let mut req = Request::builder()
+        .method(Method::CONNECT)
+        .uri(proxy.url("/"))
+        .header("sec-websocket-version", "13")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    req.extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+    let request = tokio::spawn(async move { sender.send_request(req).await });
+    tokio::time::timeout(Duration::from_secs(2), dial_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let started = tokio::time::Instant::now();
+    proxy.shutdown.take().unwrap().send(()).unwrap();
+    let mut downstream = None;
+    if complete_handshake {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        release_tx.send(()).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        downstream = Some(hyper::upgrade::on(response).await.unwrap());
+    } else {
+        drop(release_tx);
+        // The shutdown barrier must not depend on the client dropping this request.
+        drop(request);
+    }
+    tokio::time::timeout(grace + Duration::from_secs(1), proxy.shutdown())
+        .await
+        .expect("the shared deadline must also cancel pending HTTP/2 request tasks");
+    assert!(started.elapsed() < grace + Duration::from_millis(500));
+    tokio::time::timeout(Duration::from_millis(200), closed_rx)
+        .await
+        .expect("upstream must be released when run returns, not after a new grace period")
+        .unwrap();
+    server.await.unwrap();
+    drop(downstream);
+    driver.abort();
+    let _ = driver.await;
+}
+
+#[tokio::test]
+async fn shutdown_late_websocket_relay_keeps_the_original_deadline() {
+    shutdown_during_h2_ws_handshake(true, Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn shutdown_cancels_pending_http2_websocket_handshakes() {
+    for grace in [Duration::ZERO, Duration::from_secs(1)] {
+        shutdown_during_h2_ws_handshake(false, grace).await;
+    }
+}
+
+#[tokio::test]
+async fn health_rejects_array_envelopes_and_data_without_losing_partial_results() {
+    let synced = r#"{"data":{"head_slot":"123","sync_distance":"0","is_syncing":false}}"#;
+    let peers = r#"{"data":{"connected":"64"}}"#;
+    let el = MockServer::start(Arc::new(|req| {
+        let body: Value = serde_json::from_slice(&req.body).unwrap();
+        let result = match body["method"].as_str().unwrap() {
+            "eth_syncing" => json!(false),
+            "net_peerCount" => json!("0x40"),
+            "eth_getBlockByNumber" => json!({"number":"0x1","timestamp":"0x1"}),
+            method => panic!("unexpected probe {method}"),
+        };
+        (
+            StatusCode::OK,
+            serde_json::to_vec(&json!({"result":result})).unwrap(),
+        )
+    }))
+    .await;
+    for (syncing, peer_count, valid_syncing, valid_peers) in [
+        (synced, peers, true, true),
+        (r#"[["123","0",false]]"#, peers, false, true),
+        (r#"{"data":["123","0",false]}"#, peers, false, true),
+        (
+            r#"[{"head_slot":"123","sync_distance":"0","is_syncing":false}]"#,
+            peers,
+            false,
+            true,
+        ),
+        (synced, r#"[["64"]]"#, true, false),
+        (synced, r#"{"data":["64"]}"#, true, false),
+        (synced, r#"[{"connected":"64"}]"#, true, false),
+    ] {
+        let cl = MockServer::start(Arc::new(move |req| {
+            (
+                StatusCode::OK,
+                if req.path == "/eth/v1/node/syncing" {
+                    syncing
+                } else {
+                    peer_count
+                }
+                .as_bytes()
+                .to_vec(),
+            )
+        }))
+        .await;
+        let proxy =
+            EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+        let c = client();
+        let (status, _) = get(&c, &proxy.url("/readyz")).await;
+        assert_eq!(
+            status,
+            if valid_syncing {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            },
+            "{syncing}"
+        );
+        let (status, body) = get(&c, &proxy.url("/healthz")).await;
+        assert_eq!(status, StatusCode::OK);
+        let report: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(report["el"]["syncing"], false);
+        assert_eq!(
+            report["cl"]["syncing"].as_bool(),
+            valid_syncing.then_some(false)
+        );
+        assert_eq!(report["cl"]["peers"].as_u64(), valid_peers.then_some(64));
+        if !valid_syncing || !valid_peers {
+            assert!(!report["cl"]["errors"].as_array().unwrap().is_empty());
+        }
+        proxy.shutdown().await;
+    }
+}
+
+async fn ws_handshake_response(
+    proxy: &EthryxHandle,
+    h2: bool,
+    headers: &[(&str, &str)],
+) -> (Response<Incoming>, JoinHandle<()>) {
+    let socket = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+        .await
+        .unwrap();
+    let mut req = Request::builder()
+        .method(if h2 { Method::CONNECT } else { Method::GET })
+        .uri(proxy.url("/"))
+        .header("sec-websocket-version", "13")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    for (name, value) in headers {
+        req.headers_mut().append(
+            http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            value.parse().unwrap(),
+        );
+    }
+    if h2 {
+        req.extensions_mut()
+            .insert(hyper::ext::Protocol::from_static("websocket"));
+        let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake::<_, TestBody>(TokioIo::new(socket))
+            .await
+            .unwrap();
+        let driver = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        (sender.send_request(req).await.unwrap(), driver)
+    } else {
+        req.headers_mut()
+            .insert("host", "localhost".parse().unwrap());
+        req.headers_mut()
+            .insert("connection", "Upgrade".parse().unwrap());
+        req.headers_mut()
+            .insert("upgrade", "websocket".parse().unwrap());
+        req.headers_mut().insert(
+            "sec-websocket-key",
+            "dGhlIHNhbXBsZSBub25jZQ==".parse().unwrap(),
+        );
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(socket))
+            .await
+            .unwrap();
+        let driver = tokio::spawn(async move {
+            let _ = conn.with_upgrades().await;
+        });
+        (sender.send_request(req).await.unwrap(), driver)
+    }
+}
+
+#[tokio::test]
+async fn websocket_negotiates_split_protocols_without_forwarding_extensions() {
+    use tokio_tungstenite::tungstenite::handshake::server::{
+        Request as WsRequest, Response as WsResponse,
+    };
+    for (h2, large) in [(false, false), (true, false), (false, true), (true, true)] {
+        // Keep the wire case within HTTP/2's header-list limit. Unit tests also
+        // exercise 32K tokens near the larger HTTP/1 header buffer limit.
+        let first_line = if large {
+            (0..1024)
+                .rev()
+                .map(|i| format!("p{i:04}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            "first".into()
+        };
+        let expected = format!("{first_line}, Second, second, Third");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_hdr_async(
+                socket,
+                #[allow(clippy::result_large_err)] // Tungstenite fixes the callback error type.
+                move |request: &WsRequest, mut response: WsResponse| {
+                    assert!(!request.headers().contains_key("sec-websocket-extensions"));
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get_all("sec-websocket-protocol")
+                            .iter()
+                            .count(),
+                        1
+                    );
+                    assert_eq!(request.headers()["sec-websocket-protocol"], expected);
+                    response
+                        .headers_mut()
+                        .insert("sec-websocket-protocol", "second".parse().unwrap());
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let message = ws.next().await.unwrap().unwrap();
+            ws.send(message).await.unwrap();
+            let _ = ws.next().await;
+        });
+        let proxy = EthryxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
+        let (response, driver) = ws_handshake_response(
+            &proxy,
+            h2,
+            &[
+                ("sec-websocket-protocol", &first_line),
+                ("sec-websocket-protocol", " Second\t, second, Third "),
+                (
+                    "sec-websocket-extensions",
+                    "permessage-deflate; client_max_window_bits",
+                ),
+                ("sec-websocket-extensions", "unknown-extension"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            if h2 {
+                StatusCode::OK
+            } else {
+                StatusCode::SWITCHING_PROTOCOLS
+            }
+        );
+        assert_eq!(response.headers()["sec-websocket-protocol"], "second");
+        assert!(!response.headers().contains_key("sec-websocket-extensions"));
+        let upgraded = hyper::upgrade::on(response).await.unwrap();
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            TokioIo::new(upgraded),
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        ws.send(Message::Text("uncompressed round trip".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            ws.next().await.unwrap().unwrap(),
+            Message::Text("uncompressed round trip".into())
+        );
+        ws.close(None).await.unwrap();
+        proxy.shutdown().await;
+        server.await.unwrap();
+        driver.abort();
+        let _ = driver.await;
+    }
+}
+
+#[tokio::test]
+async fn websocket_rejects_split_protocol_duplicates_before_dialing() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let proxy = EthryxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
+    for h2 in [false, true] {
+        let count = if h2 { 1024 } else { 32_768 };
+        let large = (0..count)
+            .map(|i| format!("p{i:05}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        for values in [
+            vec!["first, second", "Second, third", " \tsecond\t "],
+            vec!["first", "", "second"],
+            vec![large.as_str(), " p00000 "],
+        ] {
+            let headers: Vec<_> = values
+                .iter()
+                .map(|&value| ("sec-websocket-protocol", value))
+                .collect();
+            let (response, driver) = tokio::time::timeout(
+                Duration::from_secs(3),
+                ws_handshake_response(&proxy, h2, &headers),
+            )
+            .await
+            .expect("invalid subprotocol offers must be rejected promptly");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "h2={h2}");
+            drop(response);
+            driver.abort();
+            let _ = driver.await;
+        }
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "invalid offers must not dial upstream"
+    );
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn websocket_rejects_unsolicited_extensions_and_invalid_protocol_selection() {
+    use tokio_tungstenite::tungstenite::handshake::server::{
+        Request as WsRequest, Response as WsResponse,
+    };
+    for h2 in [false, true] {
+        for selection in ["extension", "duplicate", "unoffered", "wrong-case", "list"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_hdr_async(
+                    socket,
+                    #[allow(clippy::result_large_err)]
+                    // Tungstenite fixes the callback error type.
+                    move |request: &WsRequest, mut response: WsResponse| {
+                        assert!(!request.headers().contains_key("sec-websocket-extensions"));
+                        let protocol = match selection {
+                            "unoffered" => "other",
+                            "wrong-case" => "Second",
+                            "list" => "first, second",
+                            _ => "second",
+                        };
+                        response
+                            .headers_mut()
+                            .insert("sec-websocket-protocol", protocol.parse().unwrap());
+                        if selection == "extension" {
+                            response.headers_mut().insert(
+                                "sec-websocket-extensions",
+                                "permessage-deflate".parse().unwrap(),
+                            );
+                        }
+                        if selection == "duplicate" {
+                            response
+                                .headers_mut()
+                                .append("sec-websocket-protocol", "second".parse().unwrap());
+                        }
+                        Ok(response)
+                    },
+                )
+                .await
+                .unwrap();
+                let _ = ws.next().await;
+            });
+            let proxy = EthryxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
+            let (response, driver) = ws_handshake_response(
+                &proxy,
+                h2,
+                &[
+                    ("sec-websocket-protocol", "first"),
+                    ("sec-websocket-protocol", "second"),
+                ],
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_GATEWAY,
+                "{selection}, h2={h2}"
+            );
+            proxy.shutdown().await;
+            tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .unwrap()
+                .unwrap();
+            driver.abort();
+            let _ = driver.await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn websocket_strips_hop_by_hop_and_connection_nominated_headers_on_upstream_handshake() {
+    use tokio_tungstenite::tungstenite::handshake::server::{
+        Request as WsRequest, Response as WsResponse,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_hdr_async(
+            socket,
+            #[allow(clippy::result_large_err)]
+            move |request: &WsRequest, mut response: WsResponse| {
+                let h = request.headers();
+                for stripped in [
+                    "x-internal",
+                    "proxy-authorization",
+                    "proxy-connection",
+                    "te",
+                    "keep-alive",
+                ] {
+                    assert!(!h.contains_key(stripped), "leaked {stripped}");
+                }
+                assert_eq!(h["connection"], "Upgrade");
+                assert_eq!(h["upgrade"], "websocket");
+                assert_eq!(h["sec-websocket-version"], "13");
+                assert_eq!(h["sec-websocket-protocol"], "jsonrpc");
+                assert_eq!(h["x-end-to-end"], "retained");
+                response
+                    .headers_mut()
+                    .insert("sec-websocket-protocol", "jsonrpc".parse().unwrap());
+                Ok(response)
+            },
+        )
+        .await
+        .unwrap();
+        let _ = ws.next().await;
+    });
+    let proxy = EthryxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
+    let socket = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+        .await
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(proxy.url("/"))
+        .header("host", "localhost")
+        .header(
+            "connection",
+            "Upgrade, keep-alive, X-Internal, Sec-WebSocket-Key, Sec-WebSocket-Version, Sec-WebSocket-Protocol",
+        )
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-protocol", "jsonrpc")
+        .header("x-internal", "secret")
+        .header("proxy-authorization", "Basic secret")
+        .header("proxy-connection", "keep-alive")
+        .header("te", "trailers")
+        .header("x-end-to-end", "retained")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(socket))
+        .await
+        .unwrap();
+    let driver = tokio::spawn(async move {
+        let _ = conn.with_upgrades().await;
+    });
+    let response = sender.send_request(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(response.headers()["sec-websocket-protocol"], "jsonrpc");
+    proxy.shutdown().await;
+    server.await.unwrap();
+    driver.abort();
+    let _ = driver.await;
+}
+
+#[tokio::test]
+async fn websocket_mock_mode_bounds_post_close_drain_when_upstream_keeps_tcp_open() {
+    use tokio::io::AsyncReadExt;
+    for mocking in ["false", "true"] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (released_tx, released_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(socket).await.unwrap();
+            ws.send(Message::Close(None)).await.unwrap();
+            let mut raw = ws.into_inner();
+            let mut buf = [0u8; 64];
+            while let Ok(n) = raw.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+            }
+            let _ = released_tx.send(());
+        });
+        let proxy = EthryxHandle::start(&[
+            "--trust-upstream",
+            "--mock-eth-syncing",
+            mocking,
+            "--el-ws-url",
+            &url,
+        ])
+        .await;
+        let (ws, _) = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
+            .await
+            .unwrap();
+        let _raw_client = ws.into_inner();
+        tokio::time::timeout(Duration::from_millis(2600), released_rx)
+            .await
+            .unwrap_or_else(|_| panic!("mock={mocking}: upstream must be released after Close"))
+            .unwrap();
+        server.await.unwrap();
+        proxy.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn readyz_strict_rejects_malformed_hex_quantities_in_el_probes() {
+    let now_hex = format!("0x{:x}", now_unix());
+    for bad_hex in ["0x+10", "0x0x10", "0x00", "ff"] {
+        let ts = now_hex.clone();
+        let el = MockServer::start(Arc::new(move |req| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+            let result = match method {
+                "eth_syncing" => json!(false),
+                "net_peerCount" => json!("0x10"),
+                "eth_getBlockByNumber" => json!({"number": bad_hex, "timestamp": ts}),
+                _ => json!(null),
+            };
+            let resp = json!({"jsonrpc": "2.0", "id": 1, "result": result});
+            (StatusCode::OK, serde_json::to_vec(&resp).unwrap())
+        }))
+        .await;
+        let cl = MockServer::start(Arc::new(|req| match req.path.as_str() {
+            "/eth/v1/node/syncing" => (
+                StatusCode::OK,
+                serde_json::to_vec(&json!({
+                    "data": {"head_slot": "1", "sync_distance": "0", "is_syncing": false}
+                }))
+                .unwrap(),
+            ),
+            "/eth/v1/node/peer_count" => (
+                StatusCode::OK,
+                serde_json::to_vec(&json!({"data": {"connected": "8"}})).unwrap(),
+            ),
+            _ => (StatusCode::NOT_FOUND, b"{}".to_vec()),
+        }))
+        .await;
+        let proxy = EthryxHandle::start(&[
+            "--el-http-url",
+            &el.url,
+            "--cl-beacon-url",
+            &cl.url,
+            "--readyz-strict",
+        ])
+        .await;
+        let c = client();
+        let (status, body) = get(&c, &proxy.url("/readyz")).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{bad_hex}: {body:?}"
+        );
+        let (_, hz) = get(&c, &proxy.url("/healthz")).await;
+        let hv: Value = serde_json::from_slice(&hz).unwrap();
+        assert!(hv["el"]["block_number"].is_null(), "{bad_hex}: {hv}");
+        assert!(
+            !hv["el"]["errors"].as_array().unwrap().is_empty(),
+            "{bad_hex}: {hv}"
+        );
+        proxy.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn mock_eth_syncing_forwards_non_empty_params_over_http_and_websocket() {
+    let el = MockServer::start(Arc::new(|req| (StatusCode::OK, req.body.to_vec()))).await;
+    let ws_upstream = ws_echo_upstream().await;
+    let proxy = EthryxHandle::start(&[
+        "--trust-upstream",
+        "--mock-eth-syncing",
+        "--el-http-url",
+        &el.url,
+        "--el-ws-url",
+        &ws_upstream,
+    ])
+    .await;
+    let c = client();
+    let (mut ws, _) = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
+        .await
+        .unwrap();
+    for payload in [
+        r#"{"jsonrpc":"2.0","method":"eth_syncing","params":[1,2,3],"id":1}"#,
+        r#"{"jsonrpc":"2.0","method":"eth_syncing","params":{"unexpected":1},"id":1}"#,
+    ] {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(proxy.url("/"))
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(payload)))
+            .unwrap();
+        let resp = c.request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, payload);
+
+        ws.send(Message::Text(payload.into())).await.unwrap();
+        let echoed = ws.next().await.unwrap().unwrap().into_text().unwrap();
+        assert_eq!(echoed, payload);
+    }
+    ws.close(None).await.unwrap();
+    proxy.shutdown().await;
 }

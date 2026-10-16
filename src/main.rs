@@ -1,9 +1,12 @@
 use clap::Parser;
-use ethryx::{Config, run};
+use ethryx::Config;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cfg = Config::parse();
+
+    #[cfg(feature = "otel")]
+    let telemetry = ethryx::otel::start(cfg.otel_endpoint.as_deref()).await?;
 
     use tracing_subscriber::prelude::*;
 
@@ -14,8 +17,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     #[cfg(feature = "otel")]
     {
-        if let Some(ref _otel_endpoint) = cfg.otel_endpoint {
-            let tracer = opentelemetry::global::tracer("ethryx");
+        if let Some(ref telemetry) = telemetry {
+            let tracer = telemetry.tracer();
             let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
             tracing_subscriber::registry()
                 .with(filter)
@@ -37,9 +40,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .init();
     }
 
-    run(cfg, async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
-    .await?;
+    let shutdown = async {
+        #[cfg(unix)]
+        {
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("install SIGTERM handler");
+            tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    };
+    #[cfg(feature = "otel")]
+    ethryx::run_with_telemetry(cfg, shutdown, telemetry).await?;
+    #[cfg(not(feature = "otel"))]
+    ethryx::run(cfg, shutdown).await?;
     Ok(())
 }

@@ -45,9 +45,55 @@ pub fn propagate_context(headers: &mut http::HeaderMap) {
     });
 }
 
-pub fn init_otel(
+pub struct Telemetry {
+    traces: opentelemetry_sdk::trace::SdkTracerProvider,
+    metrics: opentelemetry_sdk::metrics::SdkMeterProvider,
+}
+
+impl Telemetry {
+    pub fn tracer(&self) -> opentelemetry_sdk::trace::SdkTracer {
+        use opentelemetry::trace::TracerProvider;
+        self.traces.tracer("ethryx")
+    }
+
+    pub async fn shutdown(self) {
+        // Blocking readers/exporters must be joined outside the async worker.
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = self.metrics.shutdown();
+            let _ = self.traces.shutdown();
+        })
+        .await;
+    }
+}
+
+pub async fn start(
+    endpoint: Option<&str>,
+) -> Result<Option<Telemetry>, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(endpoint) = endpoint else {
+        return Ok(None);
+    };
+    let endpoint = endpoint.to_owned();
+    tokio::task::spawn_blocking(move || init_otel(&endpoint))
+        .await?
+        .map(Some)
+}
+
+fn signal_endpoint(
     endpoint: &str,
-) -> Result<opentelemetry_sdk::trace::SdkTracerProvider, Box<dyn std::error::Error + Send + Sync>> {
+    signal: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let uri: http::Uri = endpoint.parse()?;
+    if !matches!(uri.scheme_str(), Some("http" | "https"))
+        || uri.authority().is_none()
+        || uri.query().is_some()
+        || endpoint.contains('#')
+    {
+        return Err("OTLP endpoint must be an HTTP(S) base URL without a query or fragment".into());
+    }
+    Ok(format!("{}/v1/{signal}", endpoint.trim_end_matches('/')))
+}
+
+fn init_otel(endpoint: &str) -> Result<Telemetry, Box<dyn std::error::Error + Send + Sync>> {
     // Set global propagator to W3C TraceContext
     global::set_text_map_propagator(opentelemetry_sdk::propagation::TraceContextPropagator::new());
 
@@ -56,7 +102,7 @@ pub fn init_otel(
     // Build the OTLP Tracer Provider
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
-        .with_endpoint(endpoint)
+        .with_endpoint(signal_endpoint(endpoint, "traces")?)
         .build()?;
 
     let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
@@ -69,7 +115,7 @@ pub fn init_otel(
     // Build the OTLP Meter Provider
     let meter_exporter = opentelemetry_otlp::MetricExporter::builder()
         .with_http()
-        .with_endpoint(endpoint)
+        .with_endpoint(signal_endpoint(endpoint, "metrics")?)
         .build()?;
 
     let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(meter_exporter).build();
@@ -79,9 +125,12 @@ pub fn init_otel(
         .with_reader(reader)
         .build();
 
-    global::set_meter_provider(meter_provider);
+    global::set_meter_provider(meter_provider.clone());
 
-    Ok(tracer_provider)
+    Ok(Telemetry {
+        traces: tracer_provider,
+        metrics: meter_provider,
+    })
 }
 
 // ---- Custom metrics::Recorder bridge for OpenTelemetry ----
@@ -98,6 +147,12 @@ pub struct OtelRecorder {
     counters: RwLock<HashMap<Key, Counter>>,
     gauges: RwLock<HashMap<Key, Gauge>>,
     histograms: RwLock<HashMap<Key, Histogram>>,
+}
+
+impl Default for OtelRecorder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OtelRecorder {
@@ -238,5 +293,35 @@ struct OtelHistogram {
 impl metrics::HistogramFn for OtelHistogram {
     fn record(&self, value: f64) {
         self.histogram.record(value, &self.labels);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::signal_endpoint;
+
+    #[test]
+    fn otlp_signal_paths_preserve_the_base_path() {
+        for base in [
+            "https://collector:4318/prefix",
+            "https://collector:4318/prefix/",
+        ] {
+            assert_eq!(
+                signal_endpoint(base, "traces").unwrap(),
+                "https://collector:4318/prefix/v1/traces"
+            );
+            assert_eq!(
+                signal_endpoint(base, "metrics").unwrap(),
+                "https://collector:4318/prefix/v1/metrics"
+            );
+        }
+        for invalid in [
+            "collector:4318",
+            "ftp://collector",
+            "http://collector?x=1",
+            "http://collector/#fragment",
+        ] {
+            assert!(signal_endpoint(invalid, "traces").is_err(), "{invalid}");
+        }
     }
 }

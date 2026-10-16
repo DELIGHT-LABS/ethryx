@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/DELIGHT-LABS/ethryx/actions/workflows/ci.yml/badge.svg)](https://github.com/DELIGHT-LABS/ethryx/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/DELIGHT-LABS/ethryx?include_prereleases&sort=semver)](https://github.com/DELIGHT-LABS/ethryx/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-yellow.svg)](LICENSE)
 [![Rust 1.95+](https://img.shields.io/badge/rust-1.95%2B-blue.svg)](rust-toolchain.toml)
 
 Lightweight Rust reverse proxy and health-check sidecar for Ethereum **Execution Layer** (EL)
@@ -90,8 +90,9 @@ instead of typing both; `--cl-genesis-time 0` omits `cl.slot_age_secs`.
 ### Polling
 
 `/readyz` and `/healthz` don't query upstream per request. A background task
-polls all signals, then waits `--health-poll-interval` (default 1s; each call
-bounded by `--health-timeout`) before the next poll, and the endpoints return
+polls the EL batch and both CL endpoints concurrently, then waits
+`--health-poll-interval` (default 1s; each call
+bounded by `--health-timeout`, including the response body) before the next poll, and the endpoints return
 the latest snapshot instantly — so upstream load is constant regardless of probe
 rate, a slow upstream never blocks a probe, and the poller pauses a full interval
 between polls rather than hammering a struggling node. Block / slot ages are
@@ -126,6 +127,22 @@ HTTP/1.1 WebSocket upgrade are unchanged.
 WebSocket works over both transports: the HTTP/1.1 `Upgrade` handshake and
 HTTP/2 Extended CONNECT (RFC 8441, `:protocol=websocket`). Either is bridged to
 the upstream's HTTP/1.1 WebSocket (`--el-ws-url`).
+
+Subprotocol offers from all request header lines are combined, and the selected
+protocol is relayed from the upstream. Unsupported extensions, including
+compression, are not negotiated; unsolicited extension responses are rejected.
+Frames remain limited to 16 MiB and complete messages to 64 MiB, including
+fragmented messages. The
+relay reads in 8 KiB chunks with frame storage that grows for larger frames,
+and uses 16 KiB write buffers; ordinary forwarding needs no additional shared
+sink mutex. Tungstenite
+continues to validate masking, UTF-8, control frames, and upstream handshakes.
+
+Shutdown sets one deadline shared by HTTP connections, HTTP/2 request tasks
+and WebSocket relays. Existing work can finish during `--shutdown-grace`; late
+handshakes use the time remaining. At the deadline, pending work is cancelled,
+and the library waits for its futures and sockets to be released before returning,
+including with zero grace or an already completed shutdown future.
 
 The upstream client auto-negotiates h2 for `https://` upstreams via ALPN. A
 cleartext EL JSON-RPC upstream can't be auto-negotiated, so the health poller
@@ -245,6 +262,11 @@ The following metrics are exposed:
 
 If built with the `otel` feature, ethryx supports exporting traces and metrics to an OTLP endpoint (HTTP protocol).
 
+Pass an HTTP(S) **base URL**, optionally with a path prefix and without a query or fragment.
+Ethryx appends `/v1/traces` and `/v1/metrics` for the respective signals. The
+exporters use Rustls and run their blocking work outside Tokio workers. Both
+providers flush on orderly shutdown (Ctrl-C, or SIGTERM on Unix).
+
 ```sh
 # Build with OpenTelemetry support
 cargo build --features otel
@@ -322,6 +344,17 @@ When running `ethryx` against a fallback/secondary node or a commercial paid RPC
 - **`--mock-cl-node-health`**: Intercepts `GET/HEAD /eth/v1/node/health` requests locally and returns `HTTP 200 OK` (Beacon API standard node health), shielding commercial providers from beacon node health probes.
 - **`--cl-mev-relay-url`**: When configured (e.g., `https://boost-relay-hoodi.flashbots.net`), `ethryx` intercepts `POST /eth/v1/validator/register_validator` requests from validator clients (such as SSV Node), rewrites the request path to `/eth/v1/builder/validators`, and forwards them directly to the specified MEV Relay.
 
+With `--trust-upstream`, cleartext HTTP uses HTTP/1.1 because health-based h2c
+detection is disabled; HTTPS still negotiates via ALPN. Data-plane requests are
+never retried across protocols.
+
+The `eth_syncing` mock handles JSON-RPC 2.0 calls and entirely local batches.
+Notifications (no `id`) produce HTTP `204` or no WebSocket message; explicit
+`id: null` still receives a reply. Mixed batches and invalid requests are
+forwarded intact. HTTP POST bodies inspected by this opt-in mock are limited to
+64 MiB (`413` on overflow) and `--proxy-timeout` (`408` on a stalled body).
+Ordinary HTTP forwarding continues to stream bodies.
+
 ## Development
 
 Git hooks live in `.githooks/`. One-time setup per clone:
@@ -357,6 +390,25 @@ Common tasks (via `just`):
 Open in a devcontainer (VSCode / Codespaces) and `.devcontainer/devcontainer.json`
 installs all of the above plus the cross-compile targets automatically.
 
+### Extended validation
+
+Run the longer correctness checks explicitly:
+
+```sh
+cargo test --release --locked --lib rpc::tests::prefilter_seeded_stress_matches_full_parser \
+  -- --ignored --exact
+ETHRYX_STRESS_SECONDS=60 cargo test --release --locked --test integration \
+  websocket_sustained_churn_preserves_replies_and_releases_upstreams \
+  -- --ignored --exact --nocapture
+```
+
+The JSON check compares one million deterministic inputs with the full parser.
+The WebSocket check uses 16 concurrent clients, orderly and abrupt disconnects,
+binary messages, notifications and mock/forwarded calls; the duration applies
+to each of the two mock modes. It verifies that all upstream connections are
+released. CI runs the JSON check and a shorter five-second-per-mode churn check
+on Linux, macOS and Windows.
+
 ## Release
 
 Releases are cut with [`cargo-release`](https://github.com/crate-ci/cargo-release):
@@ -379,9 +431,51 @@ push triggers `.github/workflows/release.yml`, which:
 
 1. Verifies `Cargo.toml` version matches the tag
 2. Creates a GitHub Release with auto-generated notes
-3. Builds static `musl` binaries and attaches them with `.sha256` checksums:
+3. Generates license notices from `Cargo.lock` for each release target
+4. Builds binaries with `--locked`, verifies the archive contents, and attaches
+   them with `.sha256` checksums and build provenance attestations:
    - `ethryx-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz`
    - `ethryx-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz`
+   - `ethryx-vX.Y.Z-aarch64-apple-darwin.tar.gz`
+   - `ethryx-vX.Y.Z-x86_64-pc-windows-msvc.zip`
+
+Every binary archive includes `LICENSE` (Ethryx's dual-license notice),
+`LICENSE-MIT` and `LICENSE-APACHE` (the full license texts),
+`THIRD_PARTY_LICENSES.txt` (dependency inventory, license texts and upstream
+copyright/notice files, plus musl's copyright notice on Linux musl targets),
+and `RUST_LIBRARY_LICENSES.html` (the active Rust toolchain's library notices).
+Notice generation or archive verification failures stop the release upload.
+
+To regenerate notices locally with Python 3.9+:
+
+```sh
+cargo install cargo-about --version 0.9.2 --locked --features cli
+python3 scripts/generate-licenses.py --target x86_64-unknown-linux-musl
+# For a custom build, use the same --features / --all-features /
+# --no-default-features flags as cargo build.
+```
+
+Generated files live in `target/release-licenses/` and are not checked in.
+`about.toml` controls accepted licenses; keep it aligned with `deny.toml`.
+CI builds and verifies actual archives with both default and all features for
+every release target, using the same packaging action as releases. Run the
+archive verifier's missing/altered-file regression tests with
+`python3 -m unittest discover -s scripts -p 'test_*.py'`. Build
+dependencies and complete upstream license bundles are retained conservatively,
+so notices can include code that the final binary does not use. When changing
+Rust or the native toolchain, also review [the musl notice](licenses/README.md).
 
 `cargo-release` is configured under `[package.metadata.release]` in `Cargo.toml`
 (main-branch only, no crates.io publish, `cargo test --locked` as pre-hook).
+
+## License
+
+Ethryx is available under either the [MIT license](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE), at your option
+(`MIT OR Apache-2.0`). Third-party dependencies retain their own licenses.
+
+## Contributions
+
+By submitting a contribution for inclusion in Ethryx, you agree to license it
+under both MIT and Apache-2.0, unless you explicitly state otherwise.
+Contributions carry no additional terms or conditions unless separately agreed.

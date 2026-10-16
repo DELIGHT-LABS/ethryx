@@ -68,6 +68,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          # Rust 1.95 predates v2's Cargo 1.97+ build-warnings support.
+          rustflags: "-D warnings"
+          # Host build scripts must not leak between native and cross images.
+          cache-key: release-${{ matrix.target }}-v1
+
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.2
+
+      # Keep target and feature flags in sync with the binary build below.
+      - name: Generate license notices
+        run: python scripts/generate-licenses.py --target ${{ matrix.target }}
+
       # Build + archive + checksum locally (dry-run skips upload so files
       # remain in the workspace for attestation).
       - name: Build static binary
@@ -76,10 +93,20 @@ jobs:
         with:
           bin: ethryx
           target: ${{ matrix.target }}
+          locked: true
           archive: ethryx-$tag-$target
+          include: >-
+            LICENSE,LICENSE-MIT,LICENSE-APACHE,
+            target/release-licenses/THIRD_PARTY_LICENSES.txt,
+            target/release-licenses/RUST_LIBRARY_LICENSES.html
           checksum: sha256
           dry-run: true
-          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify archive license notices
+        run: >-
+          python scripts/check-release-archive.py
+          --archive "${{ steps.build.outputs.archive }}"
+          --target ${{ matrix.target }}
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4

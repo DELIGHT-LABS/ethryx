@@ -16,15 +16,6 @@ allow = [
     "Zlib",
 ]
 
-# `ring` ships a custom multi-license LICENSE bundle that cargo-deny cannot
-# auto-classify. The upstream file covers ISC / MIT / OpenSSL terms.
-[[licenses.clarify]]
-crate = "ring"
-expression = "ISC AND (MIT OR OpenSSL)"
-license-files = [
-    { path = "LICENSE", hash = 0xbd0eed23 },
-]
-
 [bans]
 multiple-versions = "warn"
 wildcards = "warn"
