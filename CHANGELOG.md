@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+## [0.2.5] - 2026-10-19
+
 ### Added
 
 - Include project license texts, dependency license notices, and Rust library notices in every release binary archive, with verification before upload.
